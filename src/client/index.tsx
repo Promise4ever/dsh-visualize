@@ -20,6 +20,7 @@ import { foldingSource, type FoldingHost } from './folding.ts'
 import { selectTurnCards, turnCardsDefinition, TurnCards } from './TurnCards.tsx'
 import { registerSettingsSection } from './settings.tsx'
 import { promptSinkFor } from './prompt-bridge.ts'
+import { registerOpenPageTarget } from './open-page.ts'
 
 export const name = 'dsh-visualize'
 
@@ -63,6 +64,11 @@ function turnTailOptions(host: FoldingHost) {
       ...sessionInjection(promptSinkFor(host, sessionId), sessionId),
     }),
   } as const
+}
+
+/** The host's right-sidebar browser tab opener, when that tab type exists. */
+interface SidebarBrowserFace {
+  openTab(kind: string, options?: { params?: { url?: string } }): void
 }
 
 /**
@@ -109,4 +115,15 @@ export function apply(ctx: ClientContext): void {
   })
   // 设置 → 可视化: the card style picker and the user's style files.
   registerSettingsSection(ctx)
+  // Desktop: route "open page" through the host's side bar when its browser
+  // tab is available. The server publishes the page; this only opens the URL.
+  ctx.inject(['sidebarRight'], (scope: ClientContext) => {
+    const sidebar = (scope as unknown as { sidebarRight?: SidebarBrowserFace }).sidebarRight
+    if (typeof sidebar?.openTab !== 'function') return
+    const dispose = registerOpenPageTarget((url) => {
+      sidebar.openTab('browser', { params: { url } })
+      return true
+    })
+    scope.effect(() => dispose, 'dsh-visualize: in-app open target')
+  })
 }

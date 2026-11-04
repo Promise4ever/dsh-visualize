@@ -17,6 +17,8 @@ import { styleFileLocations } from './style-guide.ts'
 import { PAGE_CONFIG_GLOBAL, STYLE_FILES_PATH, type StyleId } from './style.ts'
 import { readStyle, styleFieldSchema, type StyleSetting } from './style-setting.ts'
 import { handleStyleFiles, styleFilesHost } from './style-files.ts'
+import { createOpenPageHost, handleOpenPage, type OpenPageHost } from './open-page.ts'
+import { OPEN_PAGE_PATH } from './open-protocol.ts'
 import { IMAGE_ROUTE_PATH } from './fragment.ts'
 import { handleImageRequest, storeRoot } from './storage.ts'
 import { installSelfRepair } from './self-repair.ts'
@@ -90,6 +92,11 @@ export function apply(ctx: Context, config: Config): void {
   ctx.skills.registerProvider(() => visualizeSkillProvider(style, cwd => styleFileLocations(ctx, cwd)))
   injectPageConfig(ctx, style)
   registerStyleFiles(ctx)
+  const openPages = createOpenPageHost()
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => openPages.dispose(), 'dsh-visualize: open page host')
+  }
+  registerOpenPage(ctx, openPages)
   declineGeneratedSettingsPage(ctx)
   if (config.selfRepair !== false) installSelfRepair(ctx)
 }
@@ -149,6 +156,29 @@ function registerStyleFiles(ctx: Context): void {
       requestBody: 'buffered',
       fetch: async request => await handleStyleFiles(host, request),
     }), 'dsh-visualize: style files route')
+  })
+}
+
+/**
+ * Publish finished page documents on the host's authenticated `/api` channel.
+ * The desktop shell denies `window.open` before navigation, so the browser
+ * half posts its self-contained window document here and then opens the
+ * returned loopback URL in the in-app browser or the system browser.
+ * Optional: hosts without the channel keep the Blob-tab path.
+ * @param ctx - registrant context.
+ * @param host - the loopback page host.
+ */
+function registerOpenPage(ctx: Context, host: OpenPageHost): void {
+  ctx.inject(['connection'], (scope) => {
+    const fetch = (scope.get('connection') as { fetch?: Partial<ConnectionFetch> } | undefined)?.fetch
+    if (typeof fetch?.register !== 'function') return
+    const register = fetch.register.bind(fetch) as ConnectionFetch['register']
+    scope.effect(() => register({
+      path: OPEN_PAGE_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async request => await handleOpenPage(host, request),
+    }), 'dsh-visualize: open page route')
   })
 }
 

@@ -51,6 +51,7 @@ import { resolveTheme } from './theme.ts'
 import { liveStyle, noteSettledStyle } from './style.ts'
 import { useCardImages } from './images.ts'
 import { cardStateKey, cardStates, readStateMessage } from './card-state.ts'
+import { canOpenPageViaHost, openPageViaHost } from './open-page.ts'
 
 /** Iframe height bounds; content beyond the cap scrolls inside the frame. */
 const MIN_HEIGHT = 48
@@ -117,7 +118,10 @@ const openStyle: CSSProperties = {
  * @param stateKey - the card's saved-state key; the tab starts from that
  *   state but, with no card behind it, saves nothing.
  */
-export function openInWindow(meta: VisualizeMeta, callId: string, stateKey?: string): void {
+export type WindowOpenResult = 'opened' | 'requested' | 'unconfirmed' | 'unavailable'
+
+/** Build the standalone window document a card opens into. */
+function buildCardPage(meta: VisualizeMeta, callId: string, stateKey?: string): string {
   const { themeVars, colorScheme } = resolveTheme()
   const variant = variantOf(meta)
   const frameDoc = buildFrameDoc({
@@ -132,9 +136,50 @@ export function openInWindow(meta: VisualizeMeta, callId: string, stateKey?: str
     savedState: stateKey === undefined ? undefined : cardStates.read(stateKey),
   })
   const background = (variant === 'page' ? themeVars.page : themeVars.card) ?? ''
-  const page = buildWindowDoc({ frameDoc, title: meta.title, colorScheme, background, variant })
-  const url = URL.createObjectURL(new Blob([page], { type: 'text/html' }))
-  window.open(url, '_blank', 'noopener')
+  return buildWindowDoc({ frameDoc, title: meta.title, colorScheme, background, variant })
+}
+
+/** The browser-tab path: returns what the host allowed synchronously. */
+function openInWindowResult(meta: VisualizeMeta, callId: string, stateKey?: string): WindowOpenResult {
+  if (!canOpenWindow()) return 'unavailable'
+  try {
+    const url = URL.createObjectURL(new Blob([buildCardPage(meta, callId, stateKey)], { type: 'text/html' }))
+    const popup = window.open(url, '_blank', 'noopener')
+    if (popup === null || popup.closed) return 'unconfirmed'
+    return 'requested'
+  } catch {
+    return 'unconfirmed'
+  }
+}
+
+/**
+ * Open the card full-size in its own tab. Kept as a void entry point for
+ * callers that only want the browser path.
+ */
+export function openInWindow(meta: VisualizeMeta, callId: string, stateKey?: string): void {
+  openInWindowResult(meta, callId, stateKey)
+}
+
+/**
+ * Open the card through the desktop host when its popup policy blocks tabs:
+ * publish the finished page, then let the host open the loopback URL in its
+ * in-app browser or system browser. Any failure falls back to a Blob tab.
+ * @param meta - the card to open.
+ * @param callId - correlation token base for the frame's height reports.
+ * @param stateKey - the card's saved-state key, when it has one.
+ * @returns whether a page was opened, requested, or failed.
+ */
+export function openCardPage(meta: VisualizeMeta, callId: string, stateKey?: string): WindowOpenResult | Promise<WindowOpenResult> {
+  if (!canOpenPageViaHost()) return openInWindowResult(meta, callId, stateKey)
+  return openPageViaHost(buildCardPage(meta, callId, stateKey), meta.title)
+    .then(opened => opened ? 'opened' as const : openInWindowResult(meta, callId, stateKey))
+    .catch(() => openInWindowResult(meta, callId, stateKey))
+}
+
+/** Run a result callback whether the open attempt was synchronous or not. */
+function settleOpen(attempt: WindowOpenResult | Promise<WindowOpenResult>, done: (result: WindowOpenResult) => void): void {
+  if (typeof attempt === 'string') done(attempt)
+  else void attempt.then(done)
 }
 
 /**
@@ -392,7 +437,7 @@ export function Frame({ meta: persisted, callId, prompt, stateKey }: FrameProps)
           style={openStyle}
           aria-label={label}
           title={label}
-          onClick={() => openInWindow(meta, callId, stateKey)}
+          onClick={() => { settleOpen(openCardPage(meta, callId, stateKey), () => undefined) }}
         >
           <OpenIcon />
         </button>
@@ -537,10 +582,10 @@ function PageThumbnail({ meta, callId, stateKey, onOpen }: FrameProps & { onOpen
  * opened at all, the page renders in place as a regular card.
  */
 function PageLauncher({ meta, callId, prompt, stateKey }: FrameProps) {
-  const opens = canOpenWindow()
+  const opens = canOpenWindow() || canOpenPageViaHost()
   const [expanded, setExpanded] = useState(!opens)
   const labels = launcherLabels()
-  const open = opens ? () => openInWindow(meta, callId, stateKey) : undefined
+  const open = opens ? () => { settleOpen(openCardPage(meta, callId, stateKey), () => undefined) } : undefined
   return (
     <div style={launcherStyle} data-visualize-launcher="">
       {expanded
