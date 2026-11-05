@@ -16,7 +16,7 @@
 
 import { FRAME_CSS, PAGE_CSS } from './frame-css.ts'
 import { DEFAULT_STYLE, STYLES, type StyleId } from './style.ts'
-import { vizHelperScript, type CardState } from './viz-helper.ts'
+import { vizHelperScript } from './viz-helper.ts'
 
 /** CDN origins a fragment may load static resources from. */
 export const RESOURCE_ORIGINS = [
@@ -53,8 +53,6 @@ export const HEIGHT_MESSAGE_TYPE = 'dsh-visualize:height'
 /** Wire type of the card→frame streaming fragment update message. */
 export const STREAM_MESSAGE_TYPE = 'dsh-visualize:stream'
 
-export { PROMPT_MESSAGE_TYPE, STATE_MESSAGE_TYPE } from './viz-helper.ts'
-
 /** Inputs to one frame document assembly. */
 export interface FrameDocOptions {
   /** The validated fragment body. */
@@ -87,26 +85,6 @@ export interface FrameDocOptions {
    * `whale`, which adds nothing to the host bridge. Applies to both variants.
    */
   style?: StyleId
-  /**
-   * Whether the embedding card relays `dshViz.prompt` into the composer: only
-   * a settled in-chat card on a host with a session input does. Tabs opened
-   * with "open in new window", thumbnails and the streaming preview leave it
-   * off, and the frame then reports `dshViz.canPrompt === false`.
-   */
-  promptable?: boolean
-  /**
-   * Values the card saved through `dshViz.state` and `data-viz-keep` on an
-   * earlier load, baked into the document so fragment scripts read them
-   * before anything async. Every surface that knows the card passes them; a
-   * thumbnail or a new tab thus opens where the reader left the card.
-   */
-  savedState?: CardState | undefined
-  /**
-   * Whether the embedding card stores the frame's state changes: only a
-   * settled in-chat card does. Elsewhere `dshViz.state` lives as long as the
-   * document.
-   */
-  savesState?: boolean
 }
 
 /** Surface a frame document is laid out for. */
@@ -135,10 +113,7 @@ export function buildFrameDoc(options: FrameDocOptions): string {
 ${style.fontHref === undefined ? '' : `<link rel="stylesheet" href="${escapeHtml(style.fontHref)}">\n`}<style>${FRAME_CSS}${options.variant === 'page' ? PAGE_CSS : ''}
 :root { ${rootVars} color-scheme: ${options.colorScheme}; }
 ${options.variant === 'page' ? '' : 'body { padding: 4px 2px; }'}${style.extraCss === undefined ? '' : `\n${style.extraCss}`}</style>
-<script>${vizHelperScript(style.id, style.chart, options.promptable === true ? options.reportToken : undefined, {
-    values: options.savedState,
-    token: options.savesState === true ? options.reportToken : undefined,
-  })}</script>
+<script>${vizHelperScript(style.id, style.chart)}</script>
 </head>
 <body>
 ${options.fragment}
@@ -149,8 +124,8 @@ ${options.fragment}
 }
 
 /**
- * The frame-side height reporter: posts the document's scroll height to the
- * parent on load and on every resize, so the card can size the iframe to its
+ * The frame-side height reporter: posts the body's natural/overflow height to
+ * the parent on load and resize, so the card can grow AND shrink the iframe to its
  * content (a sandboxed frame's document is unreachable from the parent).
  * @param reportToken - correlation token echoed in each message.
  * @returns the inline script body.
@@ -159,15 +134,53 @@ function heightReporter(reportToken: string): string {
   const token = JSON.stringify(reportToken)
   return `
 (function () {
+  var body = document.body;
+  var last = -1;
+  var queued = 0;
   var post = function () {
+    // Root scrollHeight is floored at the current iframe viewport and cannot shrink.
+    // Body scrollHeight retains overflowing/positioned content; its box retains padding/borders and page min-height.
+    var height = Math.max(body.scrollHeight, body.getBoundingClientRect().height);
+    if (height === last) return;
+    last = height;
     parent.postMessage({
       type: ${JSON.stringify(HEIGHT_MESSAGE_TYPE)},
       token: ${token},
-      height: document.documentElement.scrollHeight,
+      height: height,
     }, '*');
   };
-  new ResizeObserver(post).observe(document.documentElement);
-  addEventListener('load', post);
+  var flush = function () {
+    queued = 0;
+    post();
+  };
+  // Coalesce bursts, and also catch geometry changes no box observer sees:
+  // an absolutely positioned child shrinking or an image loading changes
+  // scrollHeight while the body's border box stays put.
+  var schedule = function () {
+    if (queued) return;
+    queued = typeof requestAnimationFrame === 'function' ? requestAnimationFrame(flush) : setTimeout(flush, 16);
+  };
+  // A host that cannot observe (no constructors, or a non-Node stub) still gets
+  // the load and initial reports; observation only widens when things re-report.
+  var watch = function (fn) {
+    try {
+      fn();
+    } catch (error) {
+      /* geometry is already reported above; timers stay silent on purpose */
+    }
+  };
+  watch(function () {
+    var observer = new ResizeObserver(schedule);
+    observer.observe(document.documentElement);
+    observer.observe(body);
+  });
+  watch(function () {
+    var mutations = new MutationObserver(schedule);
+    mutations.observe(body, { subtree: true, childList: true, attributes: true, characterData: true });
+  });
+  watch(function () {
+    addEventListener('load', schedule, true);
+  });
   post();
 })();
 `
@@ -259,6 +272,7 @@ function streamSync(reportToken: string): string {
     while (cur.childNodes.length > want.length) cur.removeChild(cur.lastChild);
   }
   addEventListener('message', function (event) {
+    if (event.source !== parent) return;
     var data = event.data;
     if (!data || data.type !== ${JSON.stringify(STREAM_MESSAGE_TYPE)} || data.token !== token) return;
     if (typeof data.fragment !== 'string') return;

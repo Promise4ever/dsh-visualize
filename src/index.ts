@@ -12,16 +12,16 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { visualizeTool } from './tool.ts'
+import { MAX_META_FRAGMENT_BYTES } from './codec.ts'
 import { visualizeSkillProvider } from './skill.ts'
 import { styleFileLocations } from './style-guide.ts'
 import { PAGE_CONFIG_GLOBAL, STYLE_FILES_PATH, type StyleId } from './style.ts'
 import { readStyle, styleFieldSchema, type StyleSetting } from './style-setting.ts'
 import { handleStyleFiles, styleFilesHost } from './style-files.ts'
+import { storeRoot } from './storage.ts'
+import { DAY_MS, pruneExpiredSessions } from './storage-retention.ts'
 import { createOpenPageHost, handleOpenPage, type OpenPageHost } from './open-page.ts'
 import { OPEN_PAGE_PATH } from './open-protocol.ts'
-import { IMAGE_ROUTE_PATH } from './fragment.ts'
-import { handleImageRequest, storeRoot } from './storage.ts'
-import { installSelfRepair } from './self-repair.ts'
 
 export { VISUALIZE_TOOL_NAME } from './tool.ts'
 export { visualizeMetaFrom, type VisualizeMeta, type VisualizeMode } from './fragment.ts'
@@ -29,6 +29,7 @@ export { validateFragment } from './lint.ts'
 export { STYLE_IDS, type StyleId } from './style.ts'
 export { readStyle, type StyleSetting } from './style-setting.ts'
 export { STYLE_FILES_PATH } from './style.ts'
+export { inventoryCardStore, cleanupCardStoreTemps, type StorageInventory, type StorageInventoryOptions, type StorageCleanupResult } from './storage-maintenance.ts'
 
 /** Cordis plugin name. */
 export const name = 'dsh-visualize'
@@ -52,53 +53,84 @@ export interface Config {
    */
   style: StyleSetting
   /**
-   * Same-turn self-repair (see self-repair.ts): when a turn is about to end
-   * with a failed or broken card, or with card markup pasted into the reply
-   * instead of rendered, steer one short correction into the same turn.
-   * Default on (absent reads as on); hosts without the stop boundary ignore it.
+   * Days to keep settled card files in the per-session store. Every card's
+   * fragment is also in the session log, so an expired file is not needed to
+   * replay the conversation; retention only limits disk growth. Set to 0 to
+   * keep files forever and clean them manually with `lib/maintenance.mjs`.
    */
-  selfRepair?: boolean
+  cardRetentionDays: number
 }
 
 /** Schemastery configuration validated by the Loader. */
 export const Config: z<Config> = z.object({
-  maxFragmentBytes: z.natural().default(1_000_000),
+  maxFragmentBytes: z.natural().max(MAX_META_FRAGMENT_BYTES).default(1_000_000),
   style: styleFieldSchema(),
-  selfRepair: z.boolean().default(true).description('Same-turn self-repair · 同回合自我修复'),
+  cardRetentionDays: z.natural().max(3650).default(90),
 }) as unknown as z<Config>
 
 /**
- * Register the tool, the bundled skill provider, the page config, the
- * style-file route of the settings page, the image route, and the same-turn
- * self-repair.
+ * Register the tool, the bundled skill provider, the page config, and the
+ * style-file route of the settings page.
  * @param ctx - registrant context.
  * @param config - validated deployment configuration.
  */
 export function apply(ctx: Context, config: Config): void {
   const style = () => readStyle(config.style)
-  const imageRoute = registerImageRoute(ctx)
-  const images = { delivery: () => imageRoute.ready }
   // The tool's description names the style, so it is rebuilt when the
   // setting changes; calls already read the style per call.
   let toolStyle = style()
-  let disposeTool = ctx.tools.register(visualizeTool(ctx, config.maxFragmentBytes, style, images))
+  let disposeTool = ctx.tools.register(visualizeTool(ctx, config.maxFragmentBytes, style))
   const events = ctx as unknown as { on(name: 'loader/volatile-update', listener: () => void): unknown }
   events.on('loader/volatile-update', () => {
     if (style() === toolStyle) return
     disposeTool()
     toolStyle = style()
-    disposeTool = ctx.tools.register(visualizeTool(ctx, config.maxFragmentBytes, style, images))
+    disposeTool = ctx.tools.register(visualizeTool(ctx, config.maxFragmentBytes, style))
   })
   ctx.skills.registerProvider(() => visualizeSkillProvider(style, cwd => styleFileLocations(ctx, cwd)))
   injectPageConfig(ctx, style)
   registerStyleFiles(ctx)
   const openPages = createOpenPageHost()
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => openPages.dispose(), 'dsh-visualize: open page host')
-  }
+  ctx.effect(() => () => openPages.dispose(), 'dsh-visualize: open page host')
   registerOpenPage(ctx, openPages)
   declineGeneratedSettingsPage(ctx)
-  if (config.selfRepair !== false) installSelfRepair(ctx)
+  scheduleCardRetention(ctx, config.cardRetentionDays)
+}
+
+/**
+ * Prune expired whole-session card directories in the background, once shortly
+ * after startup and then daily. Card fragments live in the session log, so the
+ * files are only needed for later `update` calls; keeping them forever would
+ * grow the store without bound. A sweep never deletes a directory containing a
+ * lock, temporary file, unknown name, link or subdirectory, and revalidates
+ * every file before unlinking, so it cannot race an active write.
+ * @param ctx - registrant context.
+ * @param days - retention in whole days; 0 (or a host without a home path) disables the sweep.
+ */
+function scheduleCardRetention(ctx: Context, days: number): void {
+  if (!Number.isSafeInteger(days) || days <= 0) return
+  const root = storeRoot(ctx)
+  if (root === undefined) return
+  const logger = ctx.logger('dsh-visualize')
+  const run = (): void => {
+    void pruneExpiredSessions(root, { retentionDays: days }).then((result) => {
+      if (result.pruned.length > 0) {
+        logger.info('card retention: removed %d expired session(s), %d file(s)', result.pruned.length, result.removedFiles)
+      }
+    }).catch((error: unknown) => {
+      logger.warn('card retention skipped: %s', error instanceof Error ? error.message : String(error))
+    })
+  }
+  ctx.effect(() => {
+    const initial = setTimeout(run, 15_000)
+    initial.unref()
+    const timer = setInterval(run, DAY_MS)
+    timer.unref()
+    return () => {
+      clearTimeout(initial)
+      clearInterval(timer)
+    }
+  }, 'dsh-visualize: card retention')
 }
 
 /** The structured index row this plugin contributes (see `@deepseek-ai/dsh-host-webserver`). */
@@ -160,13 +192,13 @@ function registerStyleFiles(ctx: Context): void {
 }
 
 /**
- * Publish finished page documents on the host's authenticated `/api` channel.
- * The desktop shell denies `window.open` before navigation, so the browser
- * half posts its self-contained window document here and then opens the
- * returned loopback URL in the in-app browser or the system browser.
- * Optional: hosts without the channel keep the Blob-tab path.
+ * Route a finished card page through the authenticated `/api` channel. The
+ * desktop shell denies popup windows before navigation, so this is how a card
+ * can still become a real page: the browser publishes the document here, then
+ * opens the returned loopback URL in the in-app browser or system browser.
+ * Optional, like the style route.
  * @param ctx - registrant context.
- * @param host - the loopback page host.
+ * @param host - loopback page host shared by every request.
  */
 function registerOpenPage(ctx: Context, host: OpenPageHost): void {
   ctx.inject(['connection'], (scope) => {
@@ -180,38 +212,6 @@ function registerOpenPage(ctx: Context, host: OpenPageHost): void {
       fetch: async request => await handleOpenPage(host, request),
     }), 'dsh-visualize: open page route')
   })
-}
-
-/**
- * Serve stored card images on the host's `/api` channel (dsh 0.1.7+), the
- * only way their bytes reach a card without riding in the session log. The
- * returned flag tells the tool whether the route is up: on a host without
- * the channel the tool reports images as undeliverable rather than storing
- * bytes no card can fetch.
- * @param ctx - registrant context.
- * @returns a live flag, true while the route is registered.
- */
-function registerImageRoute(ctx: Context): { readonly ready: boolean } {
-  const state = { ready: false }
-  ctx.inject(['connection'], (scope) => {
-    const fetch = (scope.get('connection') as { fetch?: Partial<ConnectionFetch> } | undefined)?.fetch
-    if (typeof fetch?.register !== 'function') return
-    const register = fetch.register.bind(fetch) as ConnectionFetch['register']
-    scope.effect(() => {
-      const dispose = register({
-        path: IMAGE_ROUTE_PATH,
-        methods: ['GET', 'HEAD'],
-        requestBody: 'buffered',
-        fetch: async request => await handleImageRequest(storeRoot(ctx), request),
-      })
-      state.ready = true
-      return () => {
-        state.ready = false
-        return dispose()
-      }
-    }, 'dsh-visualize: card images route')
-  })
-  return state
 }
 
 /**

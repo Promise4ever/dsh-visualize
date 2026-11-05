@@ -1,129 +1,154 @@
-/**
- * dsh-visualize, browser half: the settled visualization card under the
- * `visualize` key of the atomic toolview hole, the streaming preview in the
- * composer's input dock, and — on hosts that fold finished turns — the turn's
- * cards again under its final answer. Clients without this half degrade to
- * the tool's generic result text by the documented toolview fallback.
- */
+/** Browser registration: one canonical tail, a light tool record, and the live dock. */
 
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
-// Type-only: pulls the `ctx.slots` Context merge.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-// Type-only: pulls the `tool.call.toolview` SlotMap declaration.
 import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
-// Type-only: pulls the `conversation.input.dock` SlotMap declaration.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { ConversationNodeDefinition } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { sessionInjection, VisualizeCard } from './VisualizeCard.tsx'
+import type { ConversationNodeDefinition, ConversationViewDefinition } from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { VisualizeCard } from './VisualizeCard.tsx'
 import { StreamingPreview, streamDefinition } from './StreamingPreview.tsx'
-import { foldingSource, type FoldingHost } from './folding.ts'
-import { selectTurnCards, turnCardsDefinition, TurnCards } from './TurnCards.tsx'
+import { createVisualizeTailSource, type FoldingHost, type SnapshotSource } from './folding.ts'
+import {
+  EMPTY_TURN_CARDS, TURN_CARDS_KEY, turnCardsDefinition, turnCardsViewDefinition, TurnCards,
+  type TurnCardsSnapshot,
+} from './TurnCards.tsx'
 import { registerSettingsSection } from './settings.tsx'
-import { promptSinkFor } from './prompt-bridge.ts'
 import { registerOpenPageTarget } from './open-page.ts'
 
 export const name = 'dsh-visualize'
-
 export const inject = ['slots']
 
-/** The Conversation event registry, where the host has one (dsh 0.1.2+). */
+type Dispose = () => void
 interface ConversationEvents {
-  register(definition: ConversationNodeDefinition): () => void
+  register(definition: ConversationNodeDefinition): Dispose
 }
-
-/**
- * Look up the Conversation event registry without declaring the service, so
- * hosts that predate it still load the plugin.
- * @param host - client context.
- * @returns the registry, or undefined on dsh 0.1.1.
- */
-function conversationEvents(host: FoldingHost): ConversationEvents | undefined {
-  const service = host.get('uiConversation') as { events?: Partial<ConversationEvents> } | undefined
-  return typeof service?.events?.register === 'function' ? service.events as ConversationEvents : undefined
+interface ConversationRuntime {
+  readonly events: ConversationEvents
+  readonly views: { register(definition: ConversationViewDefinition): Dispose }
+  binding(sessionId: string): { target?(target: string): SnapshotSource<TurnCardsSnapshot | undefined> }
 }
-
-/**
- * Turn-tail registration valid on both slot shapes the host has shipped: dsh
- * 0.1.5 and earlier declare a chain (register requires `select`, orders by
- * `priority`), 0.1.6 onward a list (register requires `id`, orders by
- * `order`). Each register validates only its own kind's field. The cards sit
- * after the host's deliverables and before other plugins' low-rank entries.
- * @param host - client context, for the folding preference.
- * @returns the register options.
- */
-function turnTailOptions(host: FoldingHost) {
-  const folds = foldingSource(host)
-  return {
-    name: 'conversation.chat.turnTail',
-    id: 'dsh-visualize-cards',
-    order: 100,
-    priority: 100,
-    select: selectTurnCards,
-    inject: (sessionId: unknown) => ({
-      hooks: { visualizeFolds: folds },
-      ...sessionInjection(promptSinkFor(host, sessionId), sessionId),
-    }),
-  } as const
-}
-
-/** The host's right-sidebar browser tab opener, when that tab type exists. */
+interface LocaleService extends SnapshotSource<{ active: string }> {}
 interface SidebarBrowserFace {
   openTab(kind: string, options?: { params?: { url?: string } }): void
 }
 
-/**
- * Register the keyed toolview, the dock preview with its stream Definition,
- * the turn-tail cards, and the settings page. Waiting on each hole's declaration mirrors the
- * official registrants: entry application order is loader-driven, and a
- * direct register racing the declaration fails boot.
- * @param ctx - client root context.
- */
+function lookup(host: FoldingHost, name: string): unknown {
+  try { return host.get(name) } catch { return undefined }
+}
+
+function conversationEvents(host: FoldingHost): ConversationEvents | undefined {
+  const service = lookup(host, 'uiConversation') as { events?: Partial<ConversationEvents> } | undefined
+  return typeof service?.events?.register === 'function' ? service.events as ConversationEvents : undefined
+}
+
+/** Old hosts remain usable through the complete toolview instead of a dead tail. */
+function conversationRuntime(host: FoldingHost): ConversationRuntime | undefined {
+  const service = lookup(host, 'uiConversation') as Partial<ConversationRuntime> | undefined
+  return typeof service?.events?.register === 'function' && typeof service.views?.register === 'function' && typeof service.binding === 'function'
+    ? service as ConversationRuntime : undefined
+}
+
+function localeOf(host: FoldingHost): LocaleService | undefined {
+  const locale = lookup(host, 'locale') as Partial<LocaleService> | undefined
+  return typeof locale?.getSnapshot === 'function' && typeof locale.subscribe === 'function' ? locale as LocaleService : undefined
+}
+
+/** target.subscribe activates the private View using the official Session binding API. */
+export function turnCardsSource(host: FoldingHost, sessionId: string): SnapshotSource<TurnCardsSnapshot | undefined> | undefined {
+  try {
+    const source = conversationRuntime(host)?.binding(sessionId).target?.(TURN_CARDS_KEY)
+    return typeof source?.getSnapshot === 'function' && typeof source.subscribe === 'function' ? source : undefined
+  } catch { return undefined }
+}
+
+/** Never hide a tool's output just because a host declares a tail-shaped slot. */
+export function tailSourceFor(host: FoldingHost, sessionId: string, registered: SnapshotSource<boolean>): SnapshotSource<boolean> {
+  return {
+    getSnapshot: () => registered.getSnapshot() && turnCardsSource(host, sessionId) !== undefined,
+    subscribe: listener => registered.subscribe(listener),
+  }
+}
+
+const EMPTY_CARDS_SOURCE: SnapshotSource<TurnCardsSnapshot | undefined> = {
+  getSnapshot: () => EMPTY_TURN_CARDS,
+  subscribe: () => () => undefined,
+}
+
+function turnTailOptions(host: FoldingHost) {
+  const locale = localeOf(host)
+  return {
+    name: 'conversation.chat.turnTail',
+    id: 'dsh-visualize-cards',
+    order: 100,
+    // Intentionally no chain selector: older chain tails cannot read the
+    // session-bound private View before mounting. Registration then falls back
+    // without suppressing their toolview, rather than claiming unrelated turns.
+    inject: (sessionId: string) => ({ hooks: {
+      visualizeCards: turnCardsSource(host, sessionId) ?? EMPTY_CARDS_SOURCE,
+      ...locale === undefined ? {} : { locale },
+    } }),
+  } as const
+}
+
 export function apply(ctx: ClientContext): void {
-  // A session-scope registration's inject receives the session id; the sink
-  // it builds lets a settled card put `dshViz.prompt` text into the composer,
-  // and the id keys the card's saved state.
-  ctx.slots.inject('tool.call.toolview', () => ctx.slots.register(
-    {
-      name: 'tool.call.toolview',
-      key: 'visualize',
-      inject: (sessionId: unknown) => sessionInjection(promptSinkFor(ctx, sessionId), sessionId),
-    },
-    VisualizeCard,
-  ))
-  // The dock reads the argument stream from Turn data the stream Definition
-  // folds; without the registry (dsh 0.1.1) it reads the session partial. The
-  // dock is declared while the Conversation service is still being built, so
-  // the Definition waits on the service itself and lives with that fiber.
+  const tail = createVisualizeTailSource()
+  ctx.slots.inject('tool.call.toolview', () => {
+    const locale = localeOf(ctx)
+    return ctx.slots.register({
+      name: 'tool.call.toolview', key: 'visualize',
+      inject: (sessionId: string) => ({ hooks: {
+        visualizeTail: tailSourceFor(ctx, sessionId, tail),
+        ...locale === undefined ? {} : { locale },
+      } }),
+    }, VisualizeCard)
+  })
   ctx.inject(['uiConversation'], (scope: ClientContext) => {
     conversationEvents(scope)?.register(streamDefinition as ConversationNodeDefinition)
   })
-  ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
-    { name: 'conversation.input.dock', id: 'visualize-stream', order: 30 },
-    StreamingPreview,
-  ))
-  // The Chat target declares the turn tail after its own settings and the
-  // Conversation registry are up, so both are resolvable here.
-  ctx.slots.inject('conversation.chat.turnTail', () => {
-    const events = conversationEvents(ctx)
-    if (events === undefined) return () => undefined
-    const disposeDefinition = events.register(turnCardsDefinition as ConversationNodeDefinition)
-    const disposeTail = ctx.slots.register(turnTailOptions(ctx), TurnCards)
-    return () => {
-      disposeTail()
-      disposeDefinition()
-    }
+  ctx.slots.inject('conversation.input.dock', () => {
+    const locale = localeOf(ctx)
+    return ctx.slots.register({
+      name: 'conversation.input.dock', id: 'visualize-stream', order: 30,
+      inject: () => locale === undefined ? {} : { hooks: { locale } },
+    }, StreamingPreview)
   })
-  // 设置 → 可视化: the card style picker and the user's style files.
-  registerSettingsSection(ctx)
-  // Desktop: route "open page" through the host's side bar when its browser
-  // tab is available. The server publishes the page; this only opens the URL.
+  ctx.slots.inject('conversation.chat.turnTail', () => {
+    const runtime = conversationRuntime(ctx)
+    if (runtime === undefined) return () => undefined
+    const disposers: Dispose[] = []
+    try {
+      disposers.push(runtime.events.register(turnCardsDefinition as ConversationNodeDefinition))
+      disposers.push(runtime.views.register(turnCardsViewDefinition as ConversationViewDefinition))
+      disposers.push(ctx.slots.register(turnTailOptions(ctx), TurnCards))
+      tail.setRegistered(true)
+    } catch (error) {
+      tail.setRegistered(false)
+      for (const dispose of [...disposers].reverse()) dispose()
+      // A legacy chain requires a selector unavailable at session-independent
+      // registration time. Keep the complete toolview on those hosts.
+      console.warn('[dsh-visualize] Canonical tail unavailable; retaining tool cards.', error)
+      return () => undefined
+    }
+    let disposed = false
+    return () => {
+      if (disposed) return
+      disposed = true
+      tail.setRegistered(false)
+      for (const dispose of [...disposers].reverse()) dispose()
+    }
+  }) 
+  // The desktop host denies popup windows; publish the page and show it in the
+  // in-app browser tab when the sidebar service is present. The node half
+  // falls back to the operating system browser when this target is absent.
   ctx.inject(['sidebarRight'], (scope: ClientContext) => {
     const sidebar = (scope as unknown as { sidebarRight?: SidebarBrowserFace }).sidebarRight
     if (typeof sidebar?.openTab !== 'function') return
-    const dispose = registerOpenPageTarget((url) => {
+    const dispose = registerOpenPageTarget(url => {
       sidebar.openTab('browser', { params: { url } })
       return true
     })
     scope.effect(() => dispose, 'dsh-visualize: in-app open target')
   })
+  // Settings retain their independent optional-host compatibility.
+  registerSettingsSection(ctx)
 }
