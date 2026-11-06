@@ -5,7 +5,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { ConversationNodeDefinition, ConversationViewDefinition } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { VisualizeCard } from './VisualizeCard.tsx'
+import { sessionInjection, VisualizeCard } from './VisualizeCard.tsx'
 import { StreamingPreview, streamDefinition } from './StreamingPreview.tsx'
 import { createVisualizeTailSource, type FoldingHost, type SnapshotSource } from './folding.ts'
 import {
@@ -14,6 +14,7 @@ import {
 } from './TurnCards.tsx'
 import { registerSettingsSection } from './settings.tsx'
 import { registerOpenPageTarget } from './open-page.ts'
+import { promptSinkFor } from './prompt-bridge.ts'
 
 export const name = 'dsh-visualize'
 export const inject = ['slots']
@@ -83,10 +84,13 @@ function turnTailOptions(host: FoldingHost) {
     // Intentionally no chain selector: older chain tails cannot read the
     // session-bound private View before mounting. Registration then falls back
     // without suppressing their toolview, rather than claiming unrelated turns.
-    inject: (sessionId: string) => ({ hooks: {
-      visualizeCards: turnCardsSource(host, sessionId) ?? EMPTY_CARDS_SOURCE,
-      ...locale === undefined ? {} : { locale },
-    } }),
+    inject: (sessionId: string) => ({
+      hooks: {
+        visualizeCards: turnCardsSource(host, sessionId) ?? EMPTY_CARDS_SOURCE,
+        ...locale === undefined ? {} : { locale },
+      },
+      ...sessionInjection(promptSinkFor(host, sessionId), sessionId),
+    }),
   } as const
 }
 
@@ -96,10 +100,13 @@ export function apply(ctx: ClientContext): void {
     const locale = localeOf(ctx)
     return ctx.slots.register({
       name: 'tool.call.toolview', key: 'visualize',
-      inject: (sessionId: string) => ({ hooks: {
-        visualizeTail: tailSourceFor(ctx, sessionId, tail),
-        ...locale === undefined ? {} : { locale },
-      } }),
+      inject: (sessionId: string) => ({
+        hooks: {
+          visualizeTail: tailSourceFor(ctx, sessionId, tail),
+          ...locale === undefined ? {} : { locale },
+        },
+        ...sessionInjection(promptSinkFor(ctx, sessionId), sessionId),
+      }),
     }, VisualizeCard)
   })
   ctx.inject(['uiConversation'], (scope: ClientContext) => {

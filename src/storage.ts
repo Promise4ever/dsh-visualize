@@ -22,20 +22,25 @@
  * other path is refused before it is read: the sandbox confines writes, not
  * reads, and a failed patch quotes card text back to the model.
  *
+ * Images a card embeds (`data-viz-src`, see images.ts) are stored beside the
+ * session's cards, content-addressed under `images/`, and each store card
+ * keeps a sidecar manifest (`<card>.images.json`) of what it resolved so an
+ * `update` can carry them. The browser reads them back through one exact
+ * route ({@link handleImageRequest}) that only ever opens a file named by a
+ * well-formed id below the store root.
+ *
  * @module @nagi-ovo/dsh-visualize/storage
  */
 
-import { randomBytes } from 'node:crypto'
-import { mkdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes } from 'node:crypto'
+import { access, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
-import { executionIdentity, type ExecutionOwner } from './ownership.ts'
-import { MAX_META_FRAGMENT_BYTES } from './codec.ts'
+import { CARD_IMAGE_TYPES, isVisualizeMode, type CardImage, type CardImageType, type VisualizeMode } from './fragment.ts'
 import { readOwnedMetadata, writeOwnedCard, type CardProperties } from './owned-storage.ts'
-import { assertPlainStorePath, isMissing, readPlainStoreText } from './storage-safety.ts'
 
 export type { CardProperties } from './owned-storage.ts'
 
@@ -46,7 +51,8 @@ export const STORE_DIR = 'visualize'
 type HomePath = (...segments: string[]) => string
 
 /** The slice of a tool execution the store reads. */
-export interface CardExec extends ExecutionOwner {
+export interface CardExec {
+  readonly agent?: { readonly session: { readonly id?: unknown; readonly header: { readonly cwd?: string } } }
   readonly signal: AbortSignal
 }
 
@@ -59,6 +65,32 @@ export interface CardFile {
   readMetadata(content: string): Promise<CardProperties | undefined>
   /** expectedContent makes an update fail if another writer has changed its base. */
   write(content: string, properties?: CardProperties, expectedContent?: string): Promise<void>
+  /** The card's image manifest; only store cards have one. */
+  readonly images?: ImageManifest
+}
+
+/** A resolved image as the manifest keeps it: the meta reference plus where it came from. */
+export interface StoredImage extends CardImage {
+  /** `url` images are carried across patches; `file` images are re-read. */
+  origin: 'url' | 'file'
+}
+
+/** The images one store card resolved. */
+export interface ImageManifest {
+  /** The recorded images; empty when there is no manifest or it is unreadable. */
+  read(): Promise<StoredImage[]>
+  write(images: readonly StoredImage[]): Promise<void>
+}
+
+/** Content-addressed image bytes for one session. */
+export interface ImageStore {
+  /**
+   * Store bytes under their digest.
+   * @returns the id the image route serves.
+   */
+  put(data: Uint8Array, type: CardImageType): Promise<string>
+  /** Whether an id names stored bytes. */
+  exists(id: string): Promise<boolean>
 }
 
 /** Card files for one tool execution. */
@@ -67,6 +99,10 @@ export interface CardStore {
   create(name: string): Promise<CardFile>
   /** The existing card a model-supplied `update` path addresses. */
   open(path: string): Promise<CardFile>
+  /** This session's image store; absent where `create` falls back to the workspace. */
+  readonly images: ImageStore | undefined
+  /** The session workspace root, as the sandbox policy names it; undefined without one. */
+  readonly workspaceRoot: string | undefined
 }
 
 /**
@@ -77,37 +113,28 @@ export interface CardStore {
  */
 export function cardStore(ctx: Context, exec: CardExec): CardStore {
   const root = storeRoot(ctx)
-  const { sessionId } = executionIdentity(exec)
+  const sessionId = exec.agent?.session.id
   const workspace = workspaceFiles(ctx, exec)
   return {
     async create(name) {
-      if (!/^[a-z0-9][a-z0-9._-]*\.html$/u.test(name) || name.length > 200) throw new Error('invalid visualization card name')
-      if (root !== undefined && exec.agent !== undefined && sessionId === undefined) throw new Error('visualization requires a valid session identity')
-      if (root === undefined || sessionId === undefined) {
+      if (root === undefined || typeof sessionId !== 'string' || sessionId.length === 0) {
         return await workspace.open(`viz/${name}`)
       }
       return ownedFile(root, join(root, 'sessions', sessionSegment(sessionId), name))
     },
+    images: root === undefined || typeof sessionId !== 'string' || sessionId.length === 0
+      ? undefined
+      : sessionImages(root, sessionSegment(sessionId)),
+    workspaceRoot: workspace.root,
     async open(path) {
-      const owned = root === undefined ? undefined : await ownedPath(root, path, sessionId)
+      const owned = root === undefined ? undefined : await ownedPath(root, path)
       if (owned !== undefined) return ownedFile(root!, owned)
-      const expanded = expandHome(path)
-      if (root !== undefined && isAbsolute(expanded) && inside(root, resolve(expanded))) {
-        throw new Error('visualization path is not an owned card in this session')
-      }
       const legacy = await workspacePath(workspace.root, path)
       if (legacy === undefined) {
         throw new Error(
           `invalid visualization patch: ${JSON.stringify(path)} is not a card visualize can patch — pass the path `
           + 'a visualize call reported (a card in the session store, or a legacy viz/ .html copy inside the workspace)',
         )
-      }
-      if (root !== undefined) {
-        const canonical = await realpathOfDeepest(resolve(workspace.root!, legacy))
-        const canonicalStore = await realpathOfDeepest(root)
-        if (canonical === canonicalStore || inside(canonicalStore, canonical)) {
-          throw new Error('visualization owned cards cannot be reached through a workspace alias')
-        }
       }
       return await workspace.open(legacy)
     },
@@ -131,7 +158,7 @@ export async function workspacePath(root: string | undefined, path: string): Pro
   const base = resolve(root)
   const target = resolve(base, expanded)
   if (!inside(base, target) || !target.endsWith('.html')) return undefined
-  const realRoot = await realpath(base)
+  const realRoot = await realpath(base).catch(() => base)
   if (!inside(realRoot, await realpathOfDeepest(target))) return undefined
   // A plain relative path resolves against this same root in the seam, which
   // keeps its display form; anything else goes in as the checked absolute path.
@@ -149,8 +176,7 @@ export async function realpathOfDeepest(target: string): Promise<string> {
   for (;;) {
     try {
       return join(await realpath(existing), relative(existing, target))
-    } catch (error) {
-      if (!isMissing(error)) throw error
+    } catch {
       const parent = dirname(existing)
       if (parent === existing) return target
       existing = parent
@@ -178,14 +204,14 @@ export function storeRoot(ctx: Context): string | undefined {
 /**
  * Encode a session id as exactly one path segment, injectively: every
  * character outside `[A-Za-z0-9_-]` — separators, dots, `~` itself — becomes
- * `~` plus its code point in fixed-width six-digit hex, so no id can name `.`, `..`, or a nested path.
+ * `~` plus its code point in hex, so no id can name `.`, `..`, or a nested path.
  * @param id - the raw session id.
  * @returns the directory name for that session.
  */
 export function sessionSegment(id: string): string {
   return Array.from(id, char => /^[A-Za-z0-9_-]$/u.test(char)
     ? char
-    : `~${char.codePointAt(0)!.toString(16).padStart(6, '0')}`).join('')
+    : `~${char.codePointAt(0)!.toString(16).padStart(4, '0')}`).join('')
 }
 
 /**
@@ -195,18 +221,21 @@ export function sessionSegment(id: string): string {
  * @param path - the `update` path as the model passed it (`~/` allowed).
  * @returns the absolute store path, or undefined when it is not a store file.
  */
-export async function ownedPath(root: string, path: string, sessionId?: string): Promise<string | undefined> {
-  const expanded = expandHome(path)
-  if (!isAbsolute(expanded) || sessionId === undefined) return undefined
+export async function ownedPath(root: string, path: string): Promise<string | undefined> {
+  const expanded = path === '~' || path.startsWith('~/') ? join(homedir(), path.slice(1)) : path
+  if (!isAbsolute(expanded)) return undefined
   const target = resolve(expanded)
-  const sessionRoot = join(root, 'sessions', sessionSegment(sessionId))
-  if (!inside(sessionRoot, target) || dirname(target) !== sessionRoot || !target.endsWith('.html')) return undefined
-  await assertPlainStorePath(root, target, true)
-  return target
-}
-
-function expandHome(path: string): string {
-  return path === '~' || path.startsWith('~/') || path.startsWith('~\\') ? join(homedir(), path.slice(1)) : path
+  if (!inside(root, target) || !target.endsWith('.html')) return undefined
+  // A symlink inside the store — the file or a directory above it — must not
+  // carry a read or a write anywhere else.
+  const real = await realpath(target).catch(async () => await realpath(dirname(target)).then(
+    parent => join(parent, 'card.html'),
+    () => undefined,
+  ))
+  // Nothing on disk yet: the card does not exist, and the read fails loudly.
+  if (real === undefined) return target
+  const realRoot = await realpath(root).catch(() => root)
+  return inside(realRoot, real) ? target : undefined
 }
 
 /**
@@ -230,10 +259,148 @@ export function inside(root: string, target: string): boolean {
 function ownedFile(root: string, path: string): CardFile {
   return {
     displayPath: displayOf(path),
-    read: async () => await readPlainStoreText(root, path, MAX_META_FRAGMENT_BYTES),
+    read: async () => await readFile(path, 'utf8'),
     readMetadata: async content => await readOwnedMetadata(root, path, content),
     write: async (content, properties, expectedContent) => await writeOwnedCard(root, path, content, properties, expectedContent),
+    images: manifestAt(`${path.slice(0, -'.html'.length)}.images.json`),
   }
+}
+
+/** Directory under a session's card directory that holds its images. */
+const IMAGE_DIR = 'images'
+
+/** File extension each image type is stored under. */
+export const IMAGE_EXTENSIONS: Readonly<Record<CardImageType, string>> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/svg+xml': 'svg',
+}
+
+/** A well-formed image id: one session segment, a sha256 digest, a known extension. */
+const IMAGE_ID = /^([A-Za-z0-9_~-]+)\/([0-9a-f]{64})\.(png|jpg|gif|webp|svg)$/u
+
+/**
+ * The store path an image id names, or undefined for anything but a
+ * well-formed id: no separator, dot segment, or other extension gets through.
+ * @param root - absolute store root.
+ * @param id - the id as a request or a manifest carries it.
+ * @returns the absolute path below the root.
+ */
+export function imagePath(root: string, id: string): string | undefined {
+  const m = IMAGE_ID.exec(id)
+  return m === null ? undefined : join(root, 'sessions', m[1]!, IMAGE_DIR, `${m[2]}.${m[3]}`)
+}
+
+/**
+ * One session's image store.
+ * @param root - absolute store root.
+ * @param segment - the session's directory name ({@link sessionSegment}).
+ * @returns the store.
+ */
+function sessionImages(root: string, segment: string): ImageStore {
+  return {
+    async put(data, type) {
+      const id = `${segment}/${createHash('sha256').update(data).digest('hex')}.${IMAGE_EXTENSIONS[type]}`
+      const path = imagePath(root, id)!
+      // Content-addressed: identical bytes are already there.
+      if (!await exists(path)) await writeFileAtomic(path, data)
+      return id
+    },
+    async exists(id) {
+      const path = imagePath(root, id)
+      return path !== undefined && await exists(path)
+    },
+  }
+}
+
+/** Whether a path exists. */
+async function exists(path: string): Promise<boolean> {
+  return await access(path).then(() => true, () => false)
+}
+
+/**
+ * A store card's sidecar manifest. Unreadable or malformed content reads as
+ * empty, so a damaged manifest costs a re-resolve, never the patch.
+ * @param path - absolute manifest path beside the card.
+ * @returns the manifest.
+ */
+function manifestAt(path: string): ImageManifest {
+  return {
+    async read() {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(await readFile(path, 'utf8'))
+      } catch {
+        return []
+      }
+      if (!Array.isArray(parsed)) return []
+      return parsed.flatMap((entry: Partial<StoredImage> | null) => {
+        if (typeof entry !== 'object' || entry === null) return []
+        const { src, id, type, bytes, origin } = entry
+        if (typeof src !== 'string' || typeof id !== 'string' || IMAGE_ID.exec(id) === null) return []
+        if (typeof bytes !== 'number' || !CARD_IMAGE_TYPES.includes(type!) || (origin !== 'url' && origin !== 'file')) return []
+        return [{ src, id, type: type!, bytes, origin }]
+      })
+    },
+    async write(images) {
+      if (images.length === 0) await rm(path, { force: true })
+      else await writeFileAtomic(path, JSON.stringify(images))
+    },
+  }
+}
+
+/**
+ * Read one stored image for the route: the id must be well formed, the file
+ * a regular file (not a symlink) whose real path stays below the store root,
+ * and its bytes must still hash to the digest the id names.
+ * @param root - absolute store root, undefined on a host without one.
+ * @param id - the requested id.
+ * @returns the bytes, or undefined when the id names nothing servable.
+ */
+export async function readStoredImage(root: string | undefined, id: string): Promise<Uint8Array | undefined> {
+  if (root === undefined) return undefined
+  const path = imagePath(root, id)
+  if (path === undefined) return undefined
+  const stat = await lstat(path).catch(() => undefined)
+  if (stat === undefined || !stat.isFile()) return undefined
+  const realRoot = await realpath(root).catch(() => root)
+  const real = await realpath(path).catch(() => undefined)
+  if (real === undefined || !inside(realRoot, real)) return undefined
+  const data = await readFile(real).catch(() => undefined)
+  if (data === undefined) return undefined
+  const digest = createHash('sha256').update(data).digest('hex')
+  return digest === IMAGE_ID.exec(id)![2] ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : undefined
+}
+
+/**
+ * Answer one request on the image route (`IMAGE_ROUTE_PATH`): `GET ?id=<image id>`. The
+ * host channel has already authenticated the browser as the owner. The bytes
+ * go out as an opaque download, never as a renderable type, so opening the
+ * URL directly cannot run an SVG's script on the app's origin; the card
+ * itself knows each image's type from its meta.
+ * @param root - absolute store root, undefined on a host without one.
+ * @param request - the request.
+ * @returns the response.
+ */
+export async function handleImageRequest(root: string | undefined, request: Request): Promise<Response> {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('method not allowed', { status: 405 })
+  const id = new URL(request.url).searchParams.get('id') ?? ''
+  const data = await readStoredImage(root, id)
+  if (data === undefined) return new Response('not found', { status: 404, headers: { 'cache-control': 'no-store' } })
+  return new Response(request.method === 'HEAD' ? null : data as Uint8Array<ArrayBuffer>, {
+    status: 200,
+    headers: {
+      'content-type': 'application/octet-stream',
+      'content-length': String(data.byteLength),
+      'content-disposition': 'attachment',
+      'content-security-policy': "default-src 'none'; sandbox",
+      'x-content-type-options': 'nosniff',
+      // Content-addressed, so a cached copy can never go stale.
+      'cache-control': 'private, max-age=31536000, immutable',
+    },
+  })
 }
 
 /**
@@ -241,9 +408,9 @@ function ownedFile(root: string, path: string): CardFile {
  * a reader never sees half of it. The rename replaces a symlink at `path`
  * rather than writing through it.
  * @param path - absolute file path; missing parent directories are created private.
- * @param content - the new text.
+ * @param content - the new text, or raw bytes.
  */
-export async function writeFileAtomic(path: string, content: string): Promise<void> {
+export async function writeFileAtomic(path: string, content: string | Uint8Array): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 })
   // Unique per write, not per millisecond: concurrent creates of the same
   // content-addressed card would otherwise share one temp file, and the
@@ -286,7 +453,7 @@ function workspaceFiles(ctx: Context, exec: CardExec): { root: string | undefine
   const sandboxPolicy = ctx.get('sandboxPolicy')?.resolve({
     ...exec.agent ? { session: exec.agent.session as never } : {},
   })
-  const cwd = sandboxPolicy?.workspaceRoot ?? exec.agent?.session.header?.cwd
+  const cwd = sandboxPolicy?.workspaceRoot ?? exec.agent?.session.header.cwd
   const resolveOpts = { ...cwd !== undefined ? { cwd } : {}, signal: exec.signal }
   return {
     root: cwd,
@@ -296,10 +463,7 @@ function workspaceFiles(ctx: Context, exec: CardExec): { root: string | undefine
         displayPath: target.displayPath,
         read: async () => await ctx.fs.readText(target, exec.signal),
         readMetadata: async () => undefined,
-        async write(content, _properties, expectedContent) {
-          if (expectedContent !== undefined && await ctx.fs.readText(target, exec.signal) !== expectedContent) {
-            throw new Error('visualization card changed since it was read')
-          }
+        async write(content) {
           await ctx.fs.writeText(target, content, undefined, exec.signal, sandboxPolicy)
         },
       }

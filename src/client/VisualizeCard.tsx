@@ -24,20 +24,37 @@
  * laid out at desktop width and scaled into the card, and a button that opens
  * the page through the same script-free wrapper. A secondary toggle shows the
  * page in the conversation, for browsers or hosts that will not open a tab.
+ *
+ * Images: a card whose meta lists `data-viz-src` images waits for their
+ * bytes from the plugin's image route and renders them as data URLs under
+ * the unchanged frame CSP (images.ts); one that fails keeps its placeholder.
+ *
+ * Prompts: where the registration injects a {@link PromptSink}, an in-chat
+ * frame's `dshViz.prompt(text)` lands in the composer as a draft, behind the
+ * parent-side gates in prompt-bridge.ts. New-window tabs and thumbnails never
+ * relay prompts.
+ *
+ * State: a settled in-chat frame's `dshViz.state` and `data-viz-keep`
+ * changes are stored per card (card-state.ts) and baked into the next
+ * document built for that card, so a reload, a reopened session or a patch
+ * starts where the reader left it. Thumbnails and new-window tabs start from
+ * the saved state but save nothing; the streaming preview has none.
  */
 
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from 'react'
 import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
 import { visualizeMetaFrom, visualizeMetaFromArgs, type VisualizeMeta } from '../fragment.ts'
 import { buildFrameDoc, type FrameVariant } from '../shell.ts'
+import { PROMPT_INTERVAL_MS, readerIsInFrame, readPromptMessage, type PromptSink } from './prompt-bridge.ts'
 import { buildWindowDoc, FRAME_SANDBOX } from '../window-doc.ts'
 import { resolveTheme } from './theme.ts'
 import { liveStyle, noteSettledStyle } from './style.ts'
-import { frameHeight, frameToken } from './frame-messages.ts'
+import { useCardImages } from './images.ts'
+import { cardStateKey, cardStates, readStateMessage } from './card-state.ts'
 import { useFirstVisible } from './frame-lifecycle.ts'
+import { frameHeight, frameToken } from './frame-messages.ts'
 import { frameLabels, useVisualizeLanguage, type VisualizeLocaleHook } from './frame-locale.ts'
 import { canOpenPageViaHost, openPageViaHost } from './open-page.ts'
-import type { SettingsLang } from './settings-locale.ts'
 
 /** Iframe height bounds; content beyond the cap scrolls inside the frame. */
 const MIN_HEIGHT = 48
@@ -93,63 +110,80 @@ const openStyle: CSSProperties = {
   outlineOffset: -2,
 }
 
-/** A navigation request is not proof a native WebView displayed a window. */
+/**
+ * Open the card full-size in its own tab. The tab is a script-free Blob page
+ * holding the same sandboxed frame (see window-doc.ts), themed as the host is
+ * right now. Synchronous end to end so the browser treats it as a user-opened
+ * tab rather than a blocked popup. The URL is not revoked: the tab can then be
+ * reloaded, and the browser frees it when the chat page unloads.
+ * @param meta - the card to open.
+ * @param callId - correlation token base for the frame's height reports.
+ * @param stateKey - the card's saved-state key; the tab starts from that
+ *   state but, with no card behind it, saves nothing.
+ */
 export type WindowOpenResult = 'opened' | 'requested' | 'unconfirmed' | 'unavailable'
 
-/**
- * Reserve a trusted blank tab synchronously, sever its opener, THEN navigate
- * to the script-free wrapper. Calling open(url, ..., 'noopener') instead
- * returns null even on successful browser opens, so it cannot detect failure.
- * Successful Blob URLs live until the host page unloads, allowing tab reloads.
- */
-export function openInWindow(meta: VisualizeMeta, callId: string): WindowOpenResult {
+/** Build the standalone, script-free page shared by popup and loopback opens. */
+function buildCardPage(meta: VisualizeMeta, callId: string, stateKey?: string): string {
+  const { themeVars, colorScheme } = resolveTheme()
+  const variant = variantOf(meta)
+  const frameDoc = buildFrameDoc({
+    fragment: meta.fragment,
+    title: meta.title,
+    themeVars,
+    colorScheme,
+    style: meta.style,
+    reportToken: frameToken(`window:${callId}`),
+    variant,
+    savedState: stateKey === undefined ? undefined : cardStates.read(stateKey),
+  })
+  const background = (variant === 'page' ? themeVars.page : themeVars.card) ?? ''
+  return buildWindowDoc({ frameDoc, title: meta.title, colorScheme, background, variant })
+}
+
+/** Blob-tab path for browsers that still honor a user-opened window. */
+function openInWindowResult(meta: VisualizeMeta, callId: string, stateKey?: string): WindowOpenResult {
   if (!canOpenWindow()) return 'unavailable'
   let popup: Window | null = null
   let url: string | undefined
   try {
     popup = window.open('about:blank', '_blank')
     if (popup === null || popup.closed) return 'unconfirmed'
-    // The only document with an opener is our trusted, empty about:blank.
-    popup.opener = null
-    if (popup.opener !== null) throw new Error('Could not isolate the new window')
-    url = URL.createObjectURL(new Blob([buildCardPage(meta, callId)], { type: 'text/html' }))
+    try { popup.opener = null } catch { /* Cross-origin/native handles may reject. */ }
+    url = URL.createObjectURL(new Blob([buildCardPage(meta, callId, stateKey)], { type: 'text/html' }))
     popup.location.replace(url)
     // Native hosts may return a handle without creating a visible window.
-    // Without a confirmed host window API, keep the in-chat fallback available.
     return '__TAURI_INTERNALS__' in window || '__TAURI__' in window ? 'unconfirmed' : 'requested'
   } catch {
     try {
       if (url !== undefined && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url)
-    } catch { /* Cleanup must not hide the usable in-chat fallback. */ }
+    } catch { /* Cleanup must not hide the in-chat fallback. */ }
     try { popup?.close() } catch { /* A native host may reject close as well. */ }
     return 'unconfirmed'
   }
 }
 
-/** Build the standalone, script-free page shared by popup and loopback opens. */
-function buildCardPage(meta: VisualizeMeta, callId: string): string {
-  const { themeVars, colorScheme } = resolveTheme()
-  const variant = variantOf(meta)
-  const frameDoc = buildFrameDoc({
-    fragment: meta.fragment, title: meta.title, themeVars, colorScheme,
-    style: meta.style, reportToken: frameToken('window:' + callId), variant,
-  })
-  const background = (variant === 'page' ? themeVars.page : themeVars.card) ?? ''
-  return buildWindowDoc({ frameDoc, title: meta.title, colorScheme, background, variant })
+/**
+ * Open a card full-size in its own tab. In the desktop host `window.open` is
+ * denied before navigation, so publish the page through the plugin's loopback
+ * route and show it in the in-app browser/system browser instead.
+ */
+export function openInWindow(meta: VisualizeMeta, callId: string, stateKey?: string): void {
+  void openInWindowResult(meta, callId, stateKey)
 }
 
 /**
- * Open a card outside the conversation. The desktop host denies popups before
- * navigation, so try its loopback page first; a browser keeps the Blob tab.
+ * Open a card outside the conversation, trying the desktop host path first.
  * @param meta - settled card metadata.
  * @param callId - stable id used to scope height messages.
- * @returns whether a page was opened, requested from a browser, or failed.
+ * @param stateKey - saved-state key for the opened page.
+ * @returns whether a page opened, was requested, or must fall back inline.
  */
-export function openCardPage(meta: VisualizeMeta, callId: string): WindowOpenResult | Promise<WindowOpenResult> {
-  if (!canOpenPageViaHost()) return openInWindow(meta, callId)
-  return openPageViaHost(buildCardPage(meta, callId), meta.title)
-    .then(opened => opened ? 'opened' as const : openInWindow(meta, callId))
-    .catch(() => openInWindow(meta, callId))
+export function openCardPage(meta: VisualizeMeta, callId: string, stateKey?: string): WindowOpenResult | Promise<WindowOpenResult> {
+  if (!canOpenPageViaHost()) return openInWindowResult(meta, callId, stateKey)
+  return openPageViaHost(buildCardPage(meta, callId, stateKey), meta.title)
+    .then(opened => opened ? 'opened' as const : openInWindowResult(meta, callId, stateKey))
+    .catch(() => openInWindowResult(meta, callId, stateKey))
 }
 
 /** Apply a synchronous browser result or wait for the desktop page round-trip. */
@@ -158,10 +192,13 @@ function settleOpen(attempt: WindowOpenResult | Promise<WindowOpenResult>, done:
   else void attempt.then(done)
 }
 
-/** Feature detection only: actual open/navigation errors are handled on click. */
+/**
+ * Whether this browser can open a card in its own tab: an embedding host may
+ * strip `window.open` or Blob URLs, and a page card then renders in place.
+ * @returns true when both are available.
+ */
 function canOpenWindow(): boolean {
-  return typeof window !== 'undefined' && typeof window.open === 'function'
-    && typeof URL.createObjectURL === 'function'
+  return typeof window.open === 'function' && typeof URL.createObjectURL === 'function'
 }
 
 /** The frame variant a card's mode lays its document out for. */
@@ -189,14 +226,14 @@ const frameStyle: CSSProperties = {
 }
 
 /** First text line of the durable result content, for the error row. */
-function firstResultLine(content: readonly { type: string; text?: string }[], fallback: string): string {
+function firstResultLine(content: readonly { type: string; text?: string }[]): string {
   for (const block of content) {
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
       const newline = block.text.indexOf('\n')
       return newline === -1 ? block.text : block.text.slice(0, newline)
     }
   }
-  return fallback
+  return 'visualization failed'
 }
 
 /**
@@ -208,10 +245,7 @@ export function useThemeTick(): number {
   const [themeTick, setThemeTick] = useState(0)
   useEffect(() => {
     const bump = () => setThemeTick(tick => tick + 1)
-    const observer = new MutationObserver(records => {
-      // A locale change must not reload an interactive frame.
-      if (records.some(record => record.attributeName !== 'lang')) bump()
-    })
+    const observer = new MutationObserver(bump)
     // Both mount points: DSH toggles dark via a body attribute, other hosts
     // conventionally re-theme via root-element attributes.
     observer.observe(document.documentElement, { attributes: true })
@@ -242,103 +276,211 @@ interface FrameDoc {
   colorScheme: 'light' | 'dark'
 }
 
+/** Which saved state a frame document starts from, and whether it saves changes. */
+interface FrameStateUse {
+  key: string
+  saves: boolean
+}
+
 /**
  * The frame document for one card, rebuilt on theme changes.
  * @param meta - the card.
  * @param reportToken - height-report correlation token.
  * @param variant - surface the document lays out for.
+ * @param promptable - whether the frame's `dshViz.prompt` is relayed.
+ * @param state - the card's saved-state key, when it has one.
  * @returns the srcdoc string and its scheme, for the iframe's own `color-scheme`.
  */
-function useFrameDoc(meta: VisualizeMeta, reportToken: string, variant: FrameVariant): FrameDoc {
+function useFrameDoc(
+  meta: VisualizeMeta, reportToken: string, variant: FrameVariant, promptable = false, state?: FrameStateUse,
+): FrameDoc {
   const themeTick = useThemeTick()
+  // Re-resolved as often as before (each new meta, each theme tick); themeTick
+  // is the deliberate trigger for the palette read.
+  const theme = useMemo(() => resolveTheme(), [meta, themeTick])
+  const themeKey = JSON.stringify(theme)
+  const stateKey = state?.key
+  // Saved state is read only when the document changes for its own reasons
+  // (markup, title, style, surface, theme), never because the state did:
+  // otherwise every input the frame records would rebuild and reload it.
+  const savedState = useMemo(
+    () => stateKey === undefined ? undefined : cardStates.read(stateKey),
+    [stateKey, themeKey, meta.fragment, meta.title, meta.style, variant],
+  )
+  const savesState = state?.saves === true
   return useMemo(() => {
-    const { themeVars, colorScheme } = resolveTheme()
     const doc = buildFrameDoc({
-      fragment: meta.fragment, title: meta.title, themeVars, colorScheme, reportToken, variant, style: meta.style,
+      fragment: meta.fragment, title: meta.title, themeVars: theme.themeVars, colorScheme: theme.colorScheme,
+      reportToken, variant, style: meta.style, promptable, savedState, savesState,
     })
-    return { doc, colorScheme }
-    // themeTick is the deliberate re-resolution trigger for the palette read.
-  }, [meta.fragment, meta.title, meta.style, reportToken, variant, themeTick])
+    return { doc, colorScheme: theme.colorScheme }
+  }, [meta, reportToken, variant, promptable, theme, savedState, savesState])
 }
 
-/** The sandboxed frame, bound to its exact WindowProxy and mounted token. */
-function SizedFrame({ meta, callId, thumbnail, width }: {
-  meta: VisualizeMeta; callId: string; thumbnail: boolean; width: number
-}) {
-  const frameRef = useRef<HTMLIFrameElement | null>(null)
-  const [token] = useState(() => frameToken(callId))
-  const [height, setHeight] = useState(MIN_HEIGHT)
+/**
+ * Store this frame's state snapshots under the card's key. As with prompts,
+ * only messages from this very frame window count; the key is the card's,
+ * never one the message names.
+ * @param frameRef - the card's iframe.
+ * @param token - the frame's correlation token.
+ * @param stateKey - the card's saved-state key, or undefined when it saves nothing.
+ */
+function useStateRelay(frameRef: RefObject<HTMLIFrameElement | null>, token: string, stateKey: string | undefined) {
   useEffect(() => {
+    if (stateKey === undefined) return
     const onMessage = (event: MessageEvent) => {
-      const measured = frameHeight(event, frameRef.current, token, MIN_HEIGHT, Math.max(...Object.values(HEIGHT_CAP)))
-      if (measured !== undefined) setHeight(measured)
+      const frame = frameRef.current
+      if (frame === null || event.source !== frame.contentWindow) return
+      const values = readStateMessage(event.data, token)
+      if (values !== undefined) cardStates.write(stateKey, values)
     }
     addEventListener('message', onMessage)
     return () => removeEventListener('message', onMessage)
-  }, [token])
-  const { doc, colorScheme } = useFrameDoc(meta, token, variantOf(meta))
-  const scale = width > 0 ? width / THUMB_VIEWPORT_WIDTH : 0.5
+  }, [frameRef, token, stateKey])
+}
+
+/**
+ * Relay this frame's `dshViz.prompt` requests into the sink. Only messages
+ * from this very frame window count — the token is readable by the fragment
+ * — and only while the reader is interacting with this frame (see
+ * {@link readerIsInFrame}), at most once per interval.
+ * @param frameRef - the card's iframe.
+ * @param token - the frame's correlation token.
+ * @param prompt - the injected sink, or undefined when prompts are off.
+ */
+function usePromptRelay(frameRef: RefObject<HTMLIFrameElement | null>, token: string, prompt: PromptSink | undefined) {
+  const lastAt = useRef(-Infinity)
+  useEffect(() => {
+    if (prompt === undefined) return
+    const onMessage = (event: MessageEvent) => {
+      const frame = frameRef.current
+      if (frame === null || event.source !== frame.contentWindow) return
+      const text = readPromptMessage(event.data, token)
+      if (text === undefined || !readerIsInFrame(frame)) return
+      const now = performance.now()
+      if (now - lastAt.current < PROMPT_INTERVAL_MS) return
+      lastAt.current = now
+      prompt(text)
+    }
+    addEventListener('message', onMessage)
+    return () => removeEventListener('message', onMessage)
+  }, [frameRef, token, prompt])
+}
+
+/** What every surface of one card shares. */
+interface FrameProps {
+  meta: VisualizeMeta
+  callId: string
+  prompt?: PromptSink | undefined
+  /** The card's saved-state key ({@link cardStateKey}); absent for a card still streaming. */
+  stateKey?: string | undefined
+  /** Host locale hook; when absent, reads document.lang. */
+  useLocale?: VisualizeLocaleHook | undefined
+}
+
+/** The sandboxed frame, sized to its content's reported height up to the mode's cap. */
+function SizedFrame({ meta, callId, prompt, stateKey }: FrameProps) {
+  const [height, setHeight] = useState(MIN_HEIGHT)
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  usePromptRelay(frameRef, callId, prompt)
+  useStateRelay(frameRef, callId, stateKey)
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const next = frameHeight(event, frameRef.current, callId, MIN_HEIGHT, HEIGHT_CAP[meta.mode])
+      if (next !== undefined) setHeight(next)
+    }
+    addEventListener('message', onMessage)
+    return () => removeEventListener('message', onMessage)
+  }, [callId, meta.mode])
+  const { doc, colorScheme } = useFrameDoc(
+    meta, callId, variantOf(meta), prompt !== undefined, stateKey === undefined ? undefined : { key: stateKey, saves: true },
+  )
   return (
     <iframe
-      key={colorScheme}
       ref={frameRef}
+      key={colorScheme}
       sandbox={FRAME_SANDBOX}
       referrerPolicy="no-referrer"
       title={meta.title}
       srcDoc={doc}
-      tabIndex={thumbnail ? -1 : undefined}
-      aria-hidden={thumbnail || undefined}
-      style={thumbnail ? {
-        ...frameStyle, position: 'absolute', top: 0, left: 0,
-        width: THUMB_VIEWPORT_WIDTH, height: THUMB_VIEWPORT_HEIGHT,
-        transform: 'scale(' + scale + ')', transformOrigin: '0 0', pointerEvents: 'none', colorScheme,
-      } : { ...frameStyle, height: Math.min(height, HEIGHT_CAP[meta.mode]), colorScheme }}
+      style={{ ...frameStyle, height, colorScheme }}
     />
   )
 }
 
-interface FrameProps {
-  meta: VisualizeMeta
-  callId: string
-  useLocale?: VisualizeLocaleHook
+/**
+ * The settled, well-formed card: header line plus the sandboxed frame, or a
+ * page card's launcher. Every surface that shows a card — the toolview, the
+ * turn tail, replay — goes through here, so a page card is a launcher in all
+ * of them.
+ */
+export function Frame(props: FrameProps) {
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  const [seen, activate] = useFirstVisible(wrapRef)
+  const [stopped, setStopped] = useState(false)
+  const labels = frameLabels(useVisualizeLanguage(props.useLocale))
+  const mounted = seen && !stopped
+  return (
+    <div ref={wrapRef} style={cardStyle} data-visualize-viewport="" data-state={mounted ? 'running' : stopped ? 'stopped' : 'waiting'}>
+      {mounted ? <FrameBody {...props} /> : (
+        <div style={{ ...noticeStyle, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <span>{stopped ? labels.stopped : labels.waiting}</span>
+          <button type="button" style={ghostButtonStyle} onClick={() => { setStopped(false); activate() }}>
+            {stopped ? labels.restart : labels.load}
+          </button>
+        </div>
+      )}
+      {mounted && (
+        <div style={{ padding: '3px 6px', textAlign: 'right' }}>
+          <button type="button" style={{ ...ghostButtonStyle, height: 24, fontSize: 11 }}
+            title={labels.releaseHint} aria-label={labels.release + ' — ' + labels.releaseHint}
+            onClick={() => setStopped(true)}>{labels.release}</button>
+        </div>
+      )}
+    </div>
+  )
 }
 
-/** All settled card surfaces share this renderer; the toolview may be only a receipt. */
-export function Frame({ meta, callId, useLocale }: FrameProps) {
-  const lang = useVisualizeLanguage(useLocale)
-  const labels = frameLabels(lang)
-  const [windowUnconfirmed, setWindowUnconfirmed] = useState(false)
+/** The visible card body; mounted only once its viewport has been seen. */
+function FrameBody({ meta: persisted, callId, prompt, stateKey, useLocale }: FrameProps) {
   const [opening, setOpening] = useState(false)
-  if (meta.mode === 'page') return <PageLauncher meta={meta} callId={callId} lang={lang} />
+  const [unconfirmed, setUnconfirmed] = useState(false)
+  const labels = frameLabels(useVisualizeLanguage(useLocale))
+  // Every surface below builds from this meta, images already embedded.
+  const meta = useCardImages(persisted)
+  if (meta === undefined) return <div style={headerStyle}>{persisted.title} · {labels.rendering}</div>
+  if (meta.mode === 'page') return <PageLauncher meta={meta} callId={callId} prompt={prompt} stateKey={stateKey} useLocale={useLocale} />
+  const open = () => {
+    if (opening) return
+    setOpening(true)
+    settleOpen(openCardPage(meta, callId, stateKey), result => {
+      setUnconfirmed(result === 'unconfirmed' || result === 'unavailable')
+      setOpening(false)
+    })
+  }
   return (
     <div style={cardStyle}>
       <div style={headerStyle} title={meta.path === '' ? meta.title : meta.path}>
         <span style={titleStyle}>{meta.title}</span>
         {meta.path !== '' && <span style={pathStyle}>{meta.path}</span>}
-        <button type="button" style={openStyle} aria-label={labels.openWindow} title={labels.openWindow}
-          aria-busy={opening} disabled={opening}
-          onClick={() => {
-            if (opening) return
-            setOpening(true)
-            settleOpen(openCardPage(meta, callId), result => {
-              setWindowUnconfirmed(result !== 'opened' && result !== 'requested')
-              setOpening(false)
-            })
-          }}>
+        <button
+          type="button"
+          style={openStyle}
+          aria-label={labels.openWindow}
+          title={labels.openWindow}
+          aria-busy={opening}
+          disabled={opening}
+          onClick={open}
+        >
           <OpenIcon />
         </button>
       </div>
-      {windowUnconfirmed && <div role="status" style={noticeStyle}>{labels.windowUnconfirmed}</div>}
-      <ManagedFrame meta={meta} callId={callId} lang={lang} />
+      {unconfirmed && <div role="status" style={noticeStyle}>{labels.windowUnconfirmed}</div>}
+      <SizedFrame meta={meta} callId={callId} prompt={prompt} stateKey={stateKey} />
     </div>
   )
 }
 
-/**
- * Thumbnail geometry: the page lays out in a desktop viewport and the frame
- * is scaled down to the launcher's width, then clipped to a fixed height, so
- * the reader sees the top of the real page rather than a reflowed narrow one.
- */
 const THUMB_VIEWPORT_WIDTH = 1280
 const THUMB_VIEWPORT_HEIGHT = 800
 const THUMB_HEIGHT = 220
@@ -402,19 +544,17 @@ const primaryButtonStyle: CSSProperties = {
 }
 
 const ghostButtonStyle: CSSProperties = { ...buttonBase, border: hostBorder, background: 'transparent', color: 'inherit' }
-
 const noticeStyle: CSSProperties = { fontSize: 12, lineHeight: 1.5, padding: '6px 12px', opacity: 0.75 }
 
-/** First visibility starts a frame; scrolling out never destroys it. Stop is explicit. */
-function ManagedFrame({ meta, callId, lang, thumbnail = false, eager = false, onOpen }: {
-  meta: VisualizeMeta; callId: string; lang: SettingsLang; thumbnail?: boolean; eager?: boolean; onOpen?: () => void
-}) {
+/**
+ * The live, inert thumbnail of a page: the same sandboxed page document, laid
+ * out at desktop width and scaled into the launcher. Pointer events and focus
+ * stay out of the frame, so it never takes a click, a scroll, or a tab stop;
+ * a click on the thumbnail opens the page like the button does.
+ */
+function PageThumbnail({ meta, callId, stateKey, onOpen }: FrameProps & { onOpen: (() => void) | undefined }) {
   const wrapRef = useRef<HTMLDivElement | null>(null)
-  const [seen, activate] = useFirstVisible(wrapRef)
-  const [stopped, setStopped] = useState(false)
   const [width, setWidth] = useState(0)
-  const labels = frameLabels(lang)
-  useEffect(() => { if (eager) activate() }, [eager, activate])
   useEffect(() => {
     const wrap = wrapRef.current
     if (wrap === null) return
@@ -425,54 +565,67 @@ function ManagedFrame({ meta, callId, lang, thumbnail = false, eager = false, on
     observer.observe(wrap)
     return () => observer.disconnect()
   }, [])
-  const mounted = seen && !stopped
+  // A distinct token: its height reports must never size another frame.
+  // It shows the saved state but, inert, never changes it.
+  const { doc, colorScheme } = useFrameDoc(
+    meta, `thumb:${callId}`, 'page', false, stateKey === undefined ? undefined : { key: stateKey, saves: false },
+  )
+  const scale = width > 0 ? width / THUMB_VIEWPORT_WIDTH : 0.5
   return (
-    <div style={cardStyle}>
-      <div ref={wrapRef} style={thumbnail ? thumbStyle : { ...cardStyle, minHeight: MIN_HEIGHT }}
-        data-visualize-viewport="" data-state={mounted ? 'running' : stopped ? 'stopped' : 'waiting'}
-        onClick={thumbnail && mounted ? onOpen : undefined}>
-        {mounted
-          ? <SizedFrame meta={meta} callId={callId} thumbnail={thumbnail} width={width} />
-          : <div style={{ ...noticeStyle, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-              <span>{stopped ? labels.stopped : labels.waiting}</span>
-              <button type="button" style={ghostButtonStyle} onClick={event => {
-                event.stopPropagation()
-                setStopped(false)
-                activate()
-              }}>{stopped ? labels.restart : labels.load}</button>
-            </div>}
-      </div>
-      {mounted && <div style={{ padding: '3px 6px', textAlign: 'right' }}>
-        <button type="button" style={{ ...ghostButtonStyle, height: 24, fontSize: 11 }}
-          title={labels.releaseHint} aria-label={labels.release + ' — ' + labels.releaseHint}
-          onClick={() => setStopped(true)}>{labels.release}</button>
-      </div>}
+    <div ref={wrapRef} style={thumbStyle} aria-hidden="true" onClick={onOpen}>
+      <iframe
+        key={colorScheme}
+        sandbox={FRAME_SANDBOX}
+        referrerPolicy="no-referrer"
+        title={meta.title}
+        srcDoc={doc}
+        tabIndex={-1}
+        style={{
+          display: 'block',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: THUMB_VIEWPORT_WIDTH,
+          height: THUMB_VIEWPORT_HEIGHT,
+          border: 0,
+          transform: `scale(${scale})`,
+          transformOrigin: '0 0',
+          pointerEvents: 'none',
+          colorScheme,
+        }}
+      />
     </div>
   )
 }
 
-/** One frame switches between inert thumbnail and expanded view without a reload. */
-function PageLauncher({ meta, callId, lang }: { meta: VisualizeMeta; callId: string; lang: SettingsLang }) {
+/**
+ * A page card in the conversation: not the page itself, which is built for a
+ * whole tab, but a launcher for it. Opening is always the reader's click — a
+ * tab opened without a user gesture is a blocked popup. Where no tab can be
+ * opened at all, the page renders in place as a regular card.
+ */
+function PageLauncher({ meta, callId, prompt, stateKey, useLocale }: FrameProps) {
   const opens = canOpenWindow() || canOpenPageViaHost()
   const [expanded, setExpanded] = useState(!opens)
-  const [requestedInline, setRequestedInline] = useState(false)
   const [windowUnconfirmed, setWindowUnconfirmed] = useState(false)
   const [opening, setOpening] = useState(false)
-  const labels = frameLabels(lang)
+  const labels = frameLabels(useVisualizeLanguage(useLocale))
   const open = () => {
     if (opening) return
     setOpening(true)
-    settleOpen(openCardPage(meta, callId), result => {
+    settleOpen(openCardPage(meta, callId, stateKey), result => {
       const failed = result === 'unconfirmed' || result === 'unavailable'
       setWindowUnconfirmed(failed)
       setOpening(false)
-      if (failed) { setRequestedInline(true); setExpanded(true) }
+      if (failed) { setExpanded(true) }
     })
   }
+  const reveal = () => setExpanded(true)
   return (
     <div style={launcherStyle} data-visualize-launcher="">
-      <ManagedFrame meta={meta} callId={callId} lang={lang} thumbnail={!expanded} eager={requestedInline}
-        onOpen={opens ? open : () => { setRequestedInline(true); setExpanded(true) }} />
+      {expanded
+        ? <SizedFrame meta={meta} callId={callId} prompt={prompt} stateKey={stateKey} />
+        : <PageThumbnail meta={meta} callId={callId} stateKey={stateKey} onOpen={opens ? open : reveal} />}
       {windowUnconfirmed && <div role="status" style={noticeStyle}>{labels.windowFallback}</div>}
       <div style={launcherBarStyle}>
         <div style={launcherTextStyle} title={meta.path === '' ? meta.title : meta.path}>
@@ -480,13 +633,16 @@ function PageLauncher({ meta, callId, lang }: { meta: VisualizeMeta; callId: str
           <div style={launcherSummaryStyle}>{meta.summary ?? labels.kind}</div>
         </div>
         <div style={actionsStyle}>
-          <button type="button" style={ghostButtonStyle} aria-expanded={expanded} onClick={() => { setRequestedInline(true); setExpanded(on => !on) }}>
+          <button type="button" style={ghostButtonStyle} aria-expanded={expanded}
+            onClick={() => setExpanded(on => !on)}>
             {expanded ? labels.hide : labels.show}
           </button>
-          {opens && <button type="button" style={primaryButtonStyle} onClick={open}
-            aria-busy={opening} disabled={opening}>
-            <OpenIcon />{labels.openPage}
-          </button>}
+          {opens && (
+            <button type="button" style={primaryButtonStyle} onClick={open}
+              aria-busy={opening} disabled={opening}>
+              <OpenIcon />{labels.openPage}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -495,42 +651,70 @@ function PageLauncher({ meta, callId, lang }: { meta: VisualizeMeta; callId: str
 
 /**
  * Keyed toolview for the `visualize` tool. Running calls and malformed or
- * failed results stay quiet single lines. Completed cards use a lightweight
- * receipt when the canonical tail owns presentation; older hosts keep the
- * full frame from durable metadata or the call's own arguments.
+ * failed results stay quiet single lines; a well-formed persisted meta — or
+ * the fragment in the call's own arguments for nested dispatches — mounts
+ * the frame. Only a settled card relays prompts.
  */
-const noTail = (selector: (value: boolean) => boolean): boolean => selector(false)
-
-export function VisualizeCard({ callId, block, useVisualizeTail, useLocale }: ToolCallViewProps & {
-  useVisualizeTail?: (selector: (value: boolean) => boolean) => boolean
+export function VisualizeCard({
+  callId, block, visualizePrompt, visualizeSession, visualizeTail, useLocale,
+}: ToolCallViewProps & VisualizePromptInjected & {
+  visualizeTail?: (selector: (value: boolean) => boolean) => boolean
   useLocale?: VisualizeLocaleHook
 }) {
-  // Always invoke the injected hook. It changes reactively as the canonical tail registers/disposes.
-  const tailOwnsCard = (useVisualizeTail ?? noTail)(value => value)
+  // Always invoke the injected hook; it changes when the canonical tail registers.
+  const tailOwnsCard = (visualizeTail ?? (selector => selector(false)))(value => value)
   const labels = frameLabels(useVisualizeLanguage(useLocale))
   // dsh 0.1.7 adds a preparing phase whose block carries no arguments yet.
   const argsRaw = 'kind' in block ? block.call?.argsRaw : 'argsRaw' in block ? block.argsRaw : undefined
   if (!('kind' in block)) {
-    // The canonical host's dock owns in-flight preview; never mount a second copy here.
+    // The canonical tail owns the in-flight preview; never mount a second copy.
     if (tailOwnsCard) return <div style={headerStyle}>{labels.rendering}</div>
     const live = visualizeMetaFromArgs(argsRaw)
     if (live !== undefined) return <Frame meta={{ ...live, style: liveStyle() }} callId={callId} useLocale={useLocale} />
     return <div style={headerStyle}>{labels.rendering}</div>
   }
   if (block.isError) {
-    return <div style={headerStyle}>{firstResultLine(block.content, labels.failed)}</div>
+    return <div style={headerStyle}>{labels.failed} · {firstResultLine(block.content)}</div>
   }
   const persisted = visualizeMetaFrom(block.meta)
   if (persisted !== undefined) noteSettledStyle(persisted.style, argsRaw)
   const fromArgs = persisted === undefined ? visualizeMetaFromArgs(argsRaw) : undefined
   const meta = persisted ?? (fromArgs === undefined ? undefined : { ...fromArgs, style: liveStyle() })
   if (meta === undefined) {
-    // A settled call without a descriptor uses its durable text, never guessed markup.
-    return <div style={headerStyle}>{firstResultLine(block.content, labels.failed)}</div>
+    // A settled call without either the descriptor or a parseable fragment:
+    // show the durable result text instead of guessing at markup.
+    return <div style={headerStyle}>{firstResultLine(block.content)}</div>
   }
-  // Only durable metadata is collected by the tail. Args-only recovery must stay visible here.
-  if (tailOwnsCard && persisted !== undefined) return <div style={headerStyle} data-visualize-receipt="" title={meta.title}>
-    <span style={titleStyle}>{meta.title}</span><span>{labels.settled}</span>
-  </div>
-  return <Frame meta={meta} callId={callId} useLocale={useLocale} />
+  // Only durable metadata is collected by the tail. Args-only recovery must
+  // stay visible here, and the tail owns settled presentation when registered.
+  if (tailOwnsCard && persisted !== undefined) {
+    return (
+      <div style={{ ...headerStyle, cursor: 'default' }} data-visualize-receipt="" title={meta.title}>
+        <span style={titleStyle}>{meta.title}</span><span>{labels.settled}</span>
+      </div>
+    )
+  }
+  return <Frame meta={meta} callId={callId} prompt={visualizePrompt}
+    stateKey={cardStateKey(visualizeSession, meta.path, callId)} useLocale={useLocale} />
+}
+
+/** Props a slot registration injects so cards can reach their session. */
+export interface VisualizePromptInjected {
+  /** Composer sink for this session; absent on hosts without a session input. */
+  visualizePrompt?: PromptSink | undefined
+  /** The session the card renders in, part of its saved-state key; absent where the host passes none. */
+  visualizeSession?: string | undefined
+}
+
+/**
+ * What a slot registration injects for one session.
+ * @param prompt - the session's composer sink.
+ * @param sessionId - the session id the registration's inject received.
+ * @returns the injected props.
+ */
+export function sessionInjection(prompt: PromptSink | undefined, sessionId: unknown): VisualizePromptInjected {
+  return {
+    visualizePrompt: prompt,
+    visualizeSession: typeof sessionId === 'string' && sessionId !== '' ? sessionId : undefined,
+  }
 }

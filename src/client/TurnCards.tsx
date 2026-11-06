@@ -17,7 +17,8 @@ import type { HostObservable, InjectFace, PropsRuntime } from '@deepseek-ai/dsh-
 // Type-only: pulls the turn-tail SlotMap declaration.
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import { visualizeMetaFrom, type VisualizeMeta } from '../fragment.ts'
-import { Frame } from './VisualizeCard.tsx'
+import { Frame, type VisualizePromptInjected } from './VisualizeCard.tsx'
+import { cardStateKey } from './card-state.ts'
 import { useVisualizeLanguage, type VisualizeLocaleHook } from './frame-locale.ts'
 
 /** Definition kind and private Conversation View target. */
@@ -76,7 +77,7 @@ function rootCallId(event: Event): string | undefined {
   const data = dataOf(event)
   if (data === undefined) return undefined
   if (event.type === 'tool/call') return idOf(data.callId)
-  if (event.type === 'tool/ptc-dispatch') return idOf(data.parentCallId)
+  if (String(event.type) === 'tool/ptc-dispatch') return idOf(data.parentCallId)
   if (event.type !== 'tool/result' || !isRecord(data.message) || !isRecord(data.message.source)) return undefined
   return idOf(data.message.source.callId)
 }
@@ -85,7 +86,7 @@ function cardFromEvent(event: Event): TurnCard | undefined {
   const data = dataOf(event)
   if (data === undefined) return undefined
   let callId: string | undefined
-  if (event.type === 'tool/ptc-dispatch') {
+  if (String(event.type) === 'tool/ptc-dispatch') {
     if (data.isError === true) return undefined
     callId = idOf(data.subCallId)
   } else if (event.type === 'tool/result') {
@@ -106,7 +107,7 @@ export function contextTurn(matches: readonly ConversationMatch[]): number | und
   for (const type of ['tool/call', 'tool/result']) {
     for (const match of matches) {
       const data = dataOf(match.event)
-      if (match.event.type === type && isTurn(data?.turn)) return data.turn
+      if (String(match.event.type) === type && isTurn(data?.turn)) return data.turn
     }
   }
   for (const match of matches) {
@@ -165,8 +166,8 @@ export const turnCardsDefinition: ConversationNodeDefinition<TurnCardsState> = {
   kind: TURN_CARDS_KEY,
   target: TURN_CARDS_KEY,
   match: (event) => {
-    if (event.type !== 'tool/call' && event.type !== 'tool/result' && event.type !== 'tool/ptc-dispatch') return null
-    if (event.type === 'tool/ptc-dispatch' && cardFromEvent(event) === undefined) return null
+    if ((event.type as string) !== 'tool/call' && (event.type as string) !== 'tool/result' && (event.type as string) !== 'tool/ptc-dispatch') return null
+    if (String(event.type) === 'tool/ptc-dispatch' && cardFromEvent(event) === undefined) return null
     const callId = rootCallId(event)
     return callId === undefined ? null : { id: callId, role: 'start' }
   },
@@ -252,13 +253,19 @@ export function selectTurnCards(owner: { turn?: TurnLocation; seq: number }): re
 
 export type TurnCardsInjected = InjectFace<{
   readonly hooks: { readonly visualizeCards: HostObservable<TurnCardsSnapshot | undefined> }
-}> & { readonly useLocale?: VisualizeLocaleHook }
+}> & VisualizePromptInjected & { readonly useLocale?: VisualizeLocaleHook }
 
 const listStyle: CSSProperties = { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 12, margin: '8px 0 4px', minWidth: 0 }
 const disclosureStyle: CSSProperties = { minWidth: 0, border: '1px solid var(--border, #8884)', borderRadius: 8, padding: '8px 10px' }
 
 /** Stable keyed groups survive prepend and never unload a visited frame on close. */
-function CardGroup({ card, primary, useLocale }: { card: TurnCard; primary: boolean; useLocale?: VisualizeLocaleHook }) {
+function CardGroup({ card, primary, useLocale, prompt, stateKey }: {
+  card: TurnCard
+  primary: boolean
+  useLocale?: VisualizeLocaleHook
+  prompt?: VisualizePromptInjected['visualizePrompt']
+  stateKey?: string
+}) {
   const [open, setOpen] = useState(primary)
   const [visited, setVisited] = useState(primary)
   const lang = useVisualizeLanguage(useLocale)
@@ -273,20 +280,31 @@ function CardGroup({ card, primary, useLocale }: { card: TurnCard; primary: bool
         {card.meta.title || (lang === 'en' ? 'Visualization' : '可视化')}
       </summary>
       {(primary || visited) && <div style={primary ? undefined : { paddingTop: 8 }}>
-        <Frame meta={card.meta} callId={'turn-tail:' + card.callId} useLocale={useLocale} />
+        <Frame meta={card.meta} callId={'turn-tail:' + card.callId} useLocale={useLocale} prompt={prompt} stateKey={stateKey} />
       </div>}
     </details>
   )
 }
 
 /** Canonical in every transcript mode; it never follows collapseTiming or work-details settings. */
-export function TurnCards({ turn, useVisualizeCards, useLocale }: PropsRuntime<'conversation.chat.turnTail'> & TurnCardsInjected) {
+export function TurnCards({
+  turn, useVisualizeCards, useLocale, visualizePrompt, visualizeSession,
+}: PropsRuntime<'conversation.chat.turnTail'> & TurnCardsInjected) {
   const snapshot = useVisualizeCards((value: TurnCardsSnapshot | undefined) => value ?? EMPTY_TURN_CARDS)
   const cards = useMemo(() => cardsForTurn(turn, snapshot), [turn, snapshot])
   if (cards.length === 0) return null
   return (
     <div style={listStyle} data-visualize-tail="true">
-      {cards.map((card, index) => <CardGroup key={card.meta.path} card={card} primary={index === 0} useLocale={useLocale} />)}
+      {cards.map((card, index) => (
+        <CardGroup
+          key={card.meta.path}
+          card={card}
+          primary={index === 0}
+          useLocale={useLocale}
+          prompt={visualizePrompt}
+          stateKey={cardStateKey(visualizeSession, card.meta.path, card.callId)}
+        />
+      ))}
     </div>
   )
 }

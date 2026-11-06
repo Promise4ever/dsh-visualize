@@ -68,11 +68,35 @@ export interface VisualizeMeta {
    * styles existed, which read as the default.
    */
   style: StyleId
-  /** Authoritative live-agent turn when exposed by the host (not a stream-frame guess). */
-  turn?: number
-  /** Session owning this result, used to reject cross-session replay attribution. */
-  sessionId?: string
+  /**
+   * Images the tool resolved from the fragment's `data-viz-src` attributes,
+   * as references only: the bytes stay in the plugin's card store and reach
+   * the card through {@link IMAGE_ROUTE_PATH}. Absent when there are none.
+   */
+  images?: CardImage[]
 }
+
+/** Image formats a card embeds; the tool verifies each by its magic bytes. */
+export type CardImageType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' | 'image/svg+xml'
+
+/** Every {@link CardImageType}. */
+export const CARD_IMAGE_TYPES: readonly CardImageType[] = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml']
+
+/** One resolved `data-viz-src`, as persisted meta carries it. */
+export interface CardImage {
+  /** The attribute value exactly as the fragment spells it, entities undecoded. */
+  src: string
+  /** Store id the image route serves: `<session segment>/<sha256>.<ext>`. */
+  id: string
+  type: CardImageType
+  bytes: number
+}
+
+/**
+ * Exact route on the host's authenticated `/api` channel (dsh 0.1.7+) that
+ * serves a stored card image by its {@link CardImage.id}.
+ */
+export const IMAGE_ROUTE_PATH = '/api/dsh-visualize/image'
 
 /**
  * Characters of real card content quoted back when a patch fails to apply, so
@@ -168,61 +192,36 @@ function countOccurrences(base: string, needle: string): number {
  * @param meta - the raw persisted meta value.
  * @returns the narrowed descriptor, or `undefined` for the generic path.
  */
-const META_CACHE = new WeakMap<object, VisualizeMeta | undefined>()
-// Session logs may pin wire objects for hours: retain only a small decoded working set.
-const META_RECENCY = new Map<object, number>()
-let cachedMetaBytes = 0
-function cacheMeta(meta: object, value: VisualizeMeta | undefined): void {
-  META_CACHE.set(meta, value)
-  if (value === undefined) return
-  const bytes = value.fragment.length * 2
-  META_RECENCY.set(meta, bytes)
-  cachedMetaBytes += bytes
-  while (META_RECENCY.size > 16 || cachedMetaBytes > 8 * 1024 * 1024) {
-    const oldest = META_RECENCY.entries().next().value
-    if (oldest === undefined) break
-    META_RECENCY.delete(oldest[0])
-    META_CACHE.delete(oldest[0])
-    cachedMetaBytes -= oldest[1]
-  }
-}
-
 export function visualizeMetaFrom(meta: unknown): VisualizeMeta | undefined {
   if (typeof meta !== 'object' || meta === null) return undefined
-  if (META_CACHE.has(meta)) {
-    const cached = META_CACHE.get(meta)
-    if (cached === undefined) return undefined
-    const bytes = META_RECENCY.get(meta) ?? 0
-    META_RECENCY.delete(meta)
-    META_RECENCY.set(meta, bytes)
-    return cached
+  const record = meta as Record<string, unknown>
+  if (record['kind'] !== 'visualize') return undefined
+  const { fragment: encoded, title, mode, path, summary } = record
+  const fragment = decodeWireFragment(encoded)
+  if (fragment === undefined || typeof title !== 'string' || typeof path !== 'string') return undefined
+  if (!isVisualizeMode(mode)) return undefined
+  return {
+    kind: 'visualize', fragment, title, mode, path, ...summaryField(summary), style: styleIdFrom(record['style']),
+    ...imagesField(record['images']),
   }
-  let result: VisualizeMeta | undefined
-  try {
-    const record = meta as Record<string, unknown>
-    if (record['kind'] === 'visualize') {
-      const { title, mode, path, summary } = record
-      if (typeof title === 'string' && typeof path === 'string' && isVisualizeMode(mode)) {
-        const fragment = decodeWireFragment(record['fragment'])
-        if (fragment !== undefined) result = {
-          kind: 'visualize', fragment, title, mode, path, ...summaryField(summary), style: styleIdFrom(record['style']),
-          ...isVisualizeTurn(record['turn']) ? { turn: record['turn'] } : {},
-          ...isVisualizeSessionId(record['sessionId']) ? { sessionId: record['sessionId'] } : {},
-        }
-      }
-    }
-  } catch { /* Corrupt/proxy wire data declines to the generic presentation. */ }
-  cacheMeta(meta, result)
-  return result
 }
 
-/** Optional replay ownership is accepted only as bounded, unambiguous wire fields. */
-export function isVisualizeTurn(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-}
-export function isVisualizeSessionId(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= 256
-    && !/[\s\u0000-\u001f\u007f-\u009f]/u.test(value)
+/**
+ * The optional image references as a spreadable field. A malformed entry is
+ * dropped on its own: that image shows its placeholder, the card still renders.
+ * @param images - the raw wire value.
+ * @returns `{ images }` with every well-formed entry, or an empty object.
+ */
+function imagesField(images: unknown): { images?: CardImage[] } {
+  if (!Array.isArray(images)) return {}
+  const list = images.flatMap((entry: unknown) => {
+    if (typeof entry !== 'object' || entry === null) return []
+    const { src, id, type, bytes } = entry as Record<string, unknown>
+    if (typeof src !== 'string' || typeof id !== 'string' || typeof bytes !== 'number') return []
+    if (!CARD_IMAGE_TYPES.includes(type as CardImageType)) return []
+    return [{ src, id, type: type as CardImageType, bytes }]
+  })
+  return list.length > 0 ? { images: list } : {}
 }
 
 /**

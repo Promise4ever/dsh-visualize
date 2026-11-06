@@ -15,11 +15,19 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
 // Type-only: pulls the `ctx.fs` Context merge.
 import type {} from '@deepseek-ai/dsh-fs'
-import { cardStore, type CardFile, type CardProperties } from './storage.ts'
-import { cardContentHash } from './owned-storage.ts'
+import { cardStore, type CardFile, type StoredImage } from './storage.ts'
 import { encodeWireFragment } from './meta-encoder.ts'
 import { MAX_META_FRAGMENT_BYTES } from './codec.ts'
-import { executionIdentity } from './ownership.ts'
+import {
+  cardImageOf,
+  DEFAULT_IMAGE_LIMITS,
+  imageReport,
+  resolveCardImages,
+  urlFetcher,
+  workspaceImageReader,
+  type ImageLimits,
+  type UrlFetcher,
+} from './images.ts'
 import { SKILL_BODY_PATH, SKILL_RESOURCE_DIR } from './skill.ts'
 import { FragmentLintGate } from './lint-gate.ts'
 import { DEFAULT_STYLE, STYLE_IDS, type StyleId } from './style.ts'
@@ -56,6 +64,22 @@ const DESCRIPTION =
   + `(its relative paths resolve against ${SKILL_RESOURCE_DIR}) with a file or shell tool; `
   + 'do not search for it anywhere else.'
 
+/** How the tool embeds `data-viz-src` images (images.ts). */
+export interface ToolImageOptions {
+  /**
+   * Whether the browser can fetch stored images right now: the plugin's
+   * image route is registered on the host's `/api` channel. Without it every
+   * image is reported as undeliverable instead of being stored for nothing.
+   */
+  readonly delivery: () => boolean
+  /** URL fetcher; defaults to the SSRF-guarded node fetcher. */
+  readonly fetchUrl?: UrlFetcher
+  readonly limits?: ImageLimits
+}
+
+/** Why images cannot reach the card on a host without the image route. */
+const NO_IMAGE_ROUTE = 'this dsh host cannot deliver images to cards (the image route needs dsh 0.1.7 or later)'
+
 /**
  * Build the `visualize` tool definition over the composed filesystem seam.
  * @param ctx - registrant context carrying `ctx.fs` and the host home path for the card copy.
@@ -64,15 +88,19 @@ const DESCRIPTION =
  *   id, or a reader the tool asks on every call so a changed setting applies
  *   to the next card. The description names the style read when the
  *   definition is built; the plugin rebuilds it when the setting changes.
+ * @param images - image embedding; by default no route, so every image is reported undeliverable.
  * @returns the tool definition to register on `ctx.tools`.
  */
 export function visualizeTool(
   ctx: Context,
   maxFragmentBytes: number,
   style: StyleId | (() => StyleId) = DEFAULT_STYLE,
+  images: ToolImageOptions = { delivery: () => false },
 ): ToolDefinition {
   const lint = new FragmentLintGate()
   const currentStyle = typeof style === 'function' ? style : () => style
+  const imageLimits = images.limits ?? DEFAULT_IMAGE_LIMITS
+  const fetchUrl = images.fetchUrl ?? urlFetcher({ maxRedirects: imageLimits.maxRedirects })
   return defineTool({
     name: VISUALIZE_TOOL_NAME,
     description: DESCRIPTION + styleToolNote(currentStyle()),
@@ -89,7 +117,8 @@ export function visualizeTool(
         type: 'string',
         description:
           'create only, required: the inline HTML fragment to render (markup, style, and script — '
-          + 'no document skeleton).',
+          + 'no document skeleton). For a workspace image or a web image off the CDN allowlist, write '
+          + '<img data-viz-src="figs/plot.png"> or <img data-viz-src="https://…"> and the tool embeds it.',
       },
       title: {
         type: 'string',
@@ -138,18 +167,33 @@ export function visualizeTool(
           fragment: { type: 'string', required: true },
           warnings: { type: 'string' },
           style: { type: 'string' },
-          turn: { type: 'integer' },
-          sessionId: { type: 'string' },
+          images: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                src: { type: 'string', required: true },
+                id: { type: 'string', required: true },
+                type: { type: 'string', required: true },
+                bytes: { type: 'integer', required: true },
+              },
+            },
+          },
+          imageReport: { type: 'string' },
         },
       },
       // Model-facing text stays a confirmation: the fragment is already in the
       // model's own output (the argument, whole or patched) and re-echoing it
       // would double its context cost. The patched path is named so a further
       // correction patches the new card rather than the superseded one.
+      // Image bytes never enter the result: the report names what was
+      // embedded and, per failed image, why.
       render: (_args, value) => [{
         type: 'text',
         text: resultText(value),
-      }, ...value.warnings ? [{ type: 'text' as const, text: value.warnings }] : []],
+      }, ...value.warnings ? [{ type: 'text' as const, text: value.warnings }] : [],
+      ...value.imageReport ? [{ type: 'text' as const, text: value.imageReport }] : []],
       // Project the fragment into persisted meta so the card survives replay:
       // the canonical value is not on the wire, only content + meta are.
       presentationMeta: (_args, value) => ({
@@ -160,8 +204,8 @@ export function visualizeTool(
         path: value.path,
         ...value.summary === undefined ? {} : { summary: value.summary },
         style: value.style ?? DEFAULT_STYLE,
-        ...value.turn === undefined ? {} : { turn: value.turn },
-        ...value.sessionId === undefined ? {} : { sessionId: value.sessionId },
+        // References only; the card fetches the bytes from the image route.
+        ...value.images?.length ? { images: value.images } : {},
       }),
     },
     // A create writes only a content-addressed card file; concurrent
@@ -174,7 +218,7 @@ export function visualizeTool(
       // A page card's file name says so, so a patch that forgets to restate
       // the mode still re-renders a launcher rather than a 1280px page
       // squeezed into the chat column.
-      const identity = executionIdentity(exec)
+      let mode = modeOf(args.mode, args.path !== undefined && action === 'update' && args.path.endsWith(PAGE_SUFFIX))
       // Cards live in a per-session store under the harness home, outside the
       // user's project (see storage.ts); legacy `viz/` workspace copies from
       // earlier sessions stay patchable through the sandboxed fs seam.
@@ -187,13 +231,14 @@ export function visualizeTool(
       // patch would leave later patches addressing a base already superseded,
       // and each would silently drop every edit but its own.
       let source: CardFile | undefined
+      let properties: import('./owned-storage.ts').CardProperties | undefined
       let fragment: string
       let base: string | undefined
-      let properties: CardProperties | undefined
       if (action === 'update') {
         source = await store.open(required(args.path, 'path', action))
         base = await source.read()
         properties = await source.readMetadata(base)
+        mode = modeOf(args.mode ?? properties?.mode, args.path !== undefined && args.path.endsWith(PAGE_SUFFIX))
         fragment = applyFragmentPatch(
           base,
           required(args.old_str, 'old_str', action),
@@ -203,24 +248,45 @@ export function visualizeTool(
         fragment = required(args.fragment, 'fragment', action)
       }
       // Coded lint: errors throw (nothing renders or is written), warnings ride on the result.
-      const { sizeBytes, warnings } = lint.check({ fragment, maxBytes: Math.min(maxFragmentBytes, MAX_META_FRAGMENT_BYTES), sessionId: identity.sessionId, base })
+      const { sizeBytes, warnings } = lint.check({ fragment, maxBytes: Math.min(maxFragmentBytes, MAX_META_FRAGMENT_BYTES), sessionId: exec.agent?.session.header?.id, base })
       // A patched card keeps its identity only if the caller restates it, so
       // the title is required on update rather than silently re-defaulted.
       const title = action === 'update' ? required(args.title, 'title', action).trim() : args.title?.trim() || 'Visualization'
-      const mode = modeOf(args.mode ?? properties?.mode, args.path !== undefined && action === 'update' && args.path.endsWith(PAGE_SUFFIX))
-      const summary = args.summary === undefined ? properties?.summary : args.summary.replaceAll(/\s+/gu, ' ').trim().slice(0, MAX_SUMMARY_CHARS)
+      const summary = args.summary === undefined
+        ? properties?.summary
+        : args.summary.replaceAll(/\s+/gu, ' ').trim().slice(0, MAX_SUMMARY_CHARS)
       // A create takes a content-addressed name — <slug>-<hash>.<style>.html —
       // so re-rendering identical bytes in the same style reuses its name. An
       // update keeps the style its card was created with, which that name
-      // records; a legacy name without one takes the historical whale default.
+      // records; a legacy name without one takes the current setting.
       const configured = currentStyle()
-      const cardStyle = action === 'update' ? properties?.style ?? styleOfCardPath(args.path!) ?? DEFAULT_STYLE : configured
+      const cardStyle = action === 'update' ? properties?.style ?? styleOfCardPath(args.path!) ?? configured : configured
       const suffix = mode === 'page' ? PAGE_SUFFIX : '.html'
-      const target = source ?? await store.create(`${slugOf(title)}-${cardContentHash(JSON.stringify({ fragment, title, mode, summary, style: cardStyle })).slice(0, 16)}.${cardStyle}${suffix}`)
-      await target.write(fragment, { title, mode, style: cardStyle, ...summary ? { summary } : {} }, base)
+      const target = source ?? await store.create(`${slugOf(title)}-${contentHash(fragment)}.${cardStyle}${suffix}`)
+      // Images resolve before anything is written: a call cancelled during a
+      // slow fetch must leave the card as it was, or its file would hold a
+      // patch no result reported and a retry of the same old_str would miss.
+      // A patch carries the URL images its card already fetched; workspace
+      // files are re-read, so a regenerated figure shows after any patch.
+      const previous: StoredImage[] = action === 'update' ? await target.images?.read() ?? [] : []
+      const resolved = await resolveCardImages(fragment, {
+        readFile: workspaceImageReader(ctx, store.workspaceRoot),
+        fetchUrl,
+        store: store.images,
+        ...images.delivery() ? {} : { unavailable: NO_IMAGE_ROUTE },
+        previous,
+        limits: imageLimits,
+        signal: exec.signal,
+      })
+      // Read as optional: specs drive execute without a signal.
+      const signal: AbortSignal | undefined = exec.signal
+      signal?.throwIfAborted()
+      await target.write(fragment, { title, mode, style: cardStyle, ...summary === undefined ? {} : { summary } }, base)
+      await target.images?.write(resolved.images)
+      const embedded = resolved.images.map(cardImageOf)
+      const report = imageReport(embedded, resolved.failures)
       return {
         action,
-        ...identity,
         path: target.displayPath,
         title,
         mode,
@@ -229,6 +295,8 @@ export function visualizeTool(
         ...summary ? { summary } : {},
         style: cardStyle,
         ...warnings ? { warnings } : {},
+        ...embedded.length > 0 ? { images: embedded } : {},
+        ...report === undefined ? {} : { imageReport: report },
       }
     },
     presentCall: () => ({
@@ -258,7 +326,7 @@ const PAGE_SUFFIX = '.page.html'
  * it: the model reads and patches the stored copy (and may `cat` it), so a
  * marker inside the markup would leak into its `old_str`.
  */
-const CARD_STYLE_PATTERN = new RegExp(`-[0-9a-f]{8,64}\\.(${STYLE_IDS.join('|')})(?:\\.page)?\\.html$`, 'u')
+const CARD_STYLE_PATTERN = new RegExp(`-[0-9a-f]{8}\\.(${STYLE_IDS.join('|')})(?:\\.page)?\\.html$`, 'u')
 
 /**
  * The style recorded in a card's file name.
@@ -354,4 +422,16 @@ function slugOf(title: string): string {
   return slug.length > 0 ? slug : 'visualization'
 }
 
-
+/**
+ * Stable 8-hex-digit content hash (FNV-1a) naming the saved copy.
+ * @param text - the fragment content.
+ * @returns the hash as fixed-width hex.
+ */
+function contentHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}

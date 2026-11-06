@@ -20,7 +20,7 @@
  */
 
 import {
-  useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties,
+  useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties,
 } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
@@ -32,13 +32,9 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 // Type-only: pulls the session-standard `useChat` selector declaration.
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import { extractStreamingFragment, trimStreamingScripts, VISUALIZE_TOOL_NAME } from '../fragment.ts'
-import { buildStreamShellDoc, STREAM_MESSAGE_TYPE } from '../shell.ts'
+import { buildStreamShellDoc, HEIGHT_MESSAGE_TYPE, STREAM_MESSAGE_TYPE } from '../shell.ts'
 import { resolveTheme } from './theme.ts'
 import { liveStyle } from './style.ts'
-import { frameHeight, frameToken } from './frame-messages.ts'
-import { useFirstVisible } from './frame-lifecycle.ts'
-import { frameLabels, useVisualizeLanguage, type VisualizeLocaleHook } from './frame-locale.ts'
-import type { SettingsLang } from './settings-locale.ts'
 
 /** Definition kind and Turn data key; namespaced by package to stay unique. */
 export const STREAM_KEY = 'dsh-visualize-stream'
@@ -213,7 +209,7 @@ export const streamDefinition: ConversationNodeDefinition<StreamState> = {
 }
 
 /** Dock entry props: the InputZone owner share (live conversation snapshot). */
-type StreamingPreviewProps = PropsRuntime<'conversation.input.dock'> & { readonly useLocale?: VisualizeLocaleHook }
+type StreamingPreviewProps = PropsRuntime<'conversation.input.dock'>
 
 /**
  * Flush interval for posting fragment updates into the persistent shell.
@@ -279,66 +275,61 @@ function useThrottled(value: string): string {
   return shown
 }
 
-/** A persistent streaming shell. No iframe or srcdoc exists until first visibility. */
-function PreviewFrame({ preview, lang }: { preview: string; lang: SettingsLang }) {
-  const frameRef = useRef<HTMLIFrameElement | null>(null)
-  const [token] = useState(() => frameToken('streaming-preview'))
-  const loaded = useRef(false)
-  const latestPreview = useRef(preview)
-  latestPreview.current = preview
-  const [contentHeight, setContentHeight] = useState(0)
-  useEffect(() => {
-    const onMessage = (event: MessageEvent) => {
-      const height = frameHeight(event, frameRef.current, token, 0, PREVIEW_MAX_HEIGHT)
-      if (height !== undefined) setContentHeight(height)
-    }
-    addEventListener('message', onMessage)
-    return () => removeEventListener('message', onMessage)
-  }, [token])
-  const { doc, colorScheme } = useMemo(() => {
-    const theme = resolveTheme()
-    return {
-      doc: buildStreamShellDoc({ ...theme, reportToken: token, style: liveStyle() }),
-      colorScheme: theme.colorScheme,
-    }
-  }, [token])
-  const postPreview = useCallback((fragment: string) => {
-    // Opaque sandbox origins require '*'; the shell also verifies source===parent and token.
-    frameRef.current?.contentWindow?.postMessage({ type: STREAM_MESSAGE_TYPE, token, fragment }, '*')
-  }, [token])
-  useEffect(() => { if (loaded.current) postPreview(preview) }, [preview, postPreview])
-  return <iframe ref={frameRef} sandbox="allow-scripts" referrerPolicy="no-referrer"
-    title={frameLabels(lang).previewTitle} srcDoc={doc}
-    style={{ ...frameStyle, colorScheme, height: contentHeight }} onLoad={() => {
-      loaded.current = true
-      postPreview(latestPreview.current)
-    }} />
-}
-
-/** Throttled parsing stays in the host; only visible previews activate an isolated document. */
-function Preview({ argsRaw, useLocale }: { argsRaw: string; useLocale?: VisualizeLocaleHook }) {
-  const lang = useVisualizeLanguage(useLocale)
-  const labels = frameLabels(lang)
+/** The mounted preview, split out so hooks only run while a call streams. */
+function Preview({ argsRaw }: { argsRaw: string }) {
   const throttled = useThrottled(argsRaw)
   const fragment = extractStreamingFragment(throttled)
   const preview = fragment === undefined ? '' : trimStreamingScripts(fragment)
   const hasContent = preview.trim().length > 0
-  const wrapRef = useRef<HTMLDivElement | null>(null)
-  const [seen, activate] = useFirstVisible(wrapRef)
-  const [stopped, setStopped] = useState(false)
-  const mounted = seen && hasContent && !stopped
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const [loaded, setLoaded] = useState(false)
+  const [contentHeight, setContentHeight] = useState(0)
+  // Follow the shell's height reports so the frame hugs what is actually
+  // painted; the CSS transition turns each growth step into a smooth reveal.
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const report = event.data as { type?: unknown; token?: unknown; height?: unknown } | null
+      if (report?.type !== HEIGHT_MESSAGE_TYPE || report.token !== 'streaming-preview') return
+      if (typeof report.height !== 'number' || !Number.isFinite(report.height)) return
+      setContentHeight(Math.max(0, Math.ceil(report.height)))
+    }
+    addEventListener('message', onMessage)
+    return () => removeEventListener('message', onMessage)
+  }, [])
+  // The shell loads ONCE per streaming call; updates flow over postMessage
+  // and sync incrementally, so unchanged components persist and new ones
+  // float in instead of the whole frame reloading per flush.
+  // The iframe takes the scheme baked into the shell: a mismatch makes the
+  // browser paint an opaque canvas behind the transparent preview.
+  const { doc, colorScheme } = useMemo(() => {
+    const theme = resolveTheme()
+    return {
+      doc: buildStreamShellDoc({ ...theme, reportToken: 'streaming-preview', style: liveStyle() }),
+      colorScheme: theme.colorScheme,
+    }
+  }, [])
+  useEffect(() => {
+    if (!loaded || !hasContent) return
+    frameRef.current?.contentWindow?.postMessage({
+      type: STREAM_MESSAGE_TYPE,
+      token: 'streaming-preview',
+      fragment: preview,
+    }, '*')
+  }, [loaded, hasContent, preview])
   return (
-    <div ref={wrapRef} style={wrapStyle} data-visualize-preview="">
-      <div style={{ ...labelStyle, display: 'flex', gap: 8, alignItems: 'center' }}>
-        <span>{hasContent ? labels.streaming : labels.composing}</span>
-        {hasContent && <button type="button" style={{ font: 'inherit', color: 'inherit', cursor: 'pointer' }}
-          title={mounted ? labels.releaseHint : stopped ? labels.stopped : labels.waiting}
-          onClick={() => {
-            if (mounted) setStopped(true)
-            else { setStopped(false); activate() }
-          }}>{mounted ? labels.release : stopped ? labels.restart : labels.load}</button>}
+    <div style={wrapStyle}>
+      <div style={labelStyle}>
+        {hasContent ? 'Visualize · streaming preview' : 'Visualize · composing…'}
       </div>
-      {mounted && <PreviewFrame preview={preview} lang={lang} />}
+      <iframe
+        ref={frameRef}
+        sandbox="allow-scripts"
+        referrerPolicy="no-referrer"
+        title="Visualization streaming preview"
+        srcDoc={doc}
+        style={{ ...frameStyle, colorScheme, height: hasContent ? Math.min(contentHeight, PREVIEW_MAX_HEIGHT) : 0 }}
+        onLoad={() => setLoaded(true)}
+      />
     </div>
   )
 }
@@ -363,13 +354,13 @@ export function latestStreamSource(timeline: ConversationTimelineSnapshot | unde
 }
 
 /** Dock body on hosts with the Conversation registry (dsh 0.1.2+). */
-function TurnStream({ useChat, useLocale }: { useChat: StreamingPreviewProps['useChat']; useLocale?: VisualizeLocaleHook }) {
+function TurnStream({ useChat }: { useChat: StreamingPreviewProps['useChat'] }) {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- a host may publish no Chat snapshot yet
-  const source: StreamSource = useChat((snapshot: { readonly timeline?: ConversationTimelineSnapshot } | undefined) => latestStreamSource(snapshot?.timeline)) ?? NO_SOURCE
-  const stream = useSyncExternalStore<Readonly<VisualizeStreamData> | undefined>(source.subscribe, source.getSnapshot)
+  const source = useChat(snapshot => latestStreamSource(snapshot?.timeline)) ?? NO_SOURCE
+  const stream = useSyncExternalStore(source.subscribe, source.getSnapshot)
   if (stream === undefined) return null
   // Keyed by call: a second visualize call in the same turn gets a fresh shell.
-  return <Preview key={stream.callId} argsRaw={stream.argsRaw} useLocale={useLocale} />
+  return <Preview key={stream.callId} argsRaw={stream.argsRaw} />
 }
 
 /** The slice of a dsh 0.1.1 session snapshot the legacy path reads. */
@@ -380,9 +371,9 @@ interface LegacyPartial {
 /**
  * Dock entry: mounts the preview exactly while a `visualize` call streams.
  */
-export function StreamingPreview({ session, useChat, useLocale }: StreamingPreviewProps) {
+export function StreamingPreview({ session, useChat }: StreamingPreviewProps) {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- absent on dsh 0.1.1
-  if (typeof useChat === 'function') return <TurnStream useChat={useChat} useLocale={useLocale} />
+  if (typeof useChat === 'function') return <TurnStream useChat={useChat} />
   // dsh 0.1.1: the streaming partial still rides on the session snapshot.
   // Defensive guard mirroring the official dock rows: a host passing no
   // session must degrade to an empty dock instead of crashing.
@@ -393,5 +384,5 @@ export function StreamingPreview({ session, useChat, useLocale }: StreamingPrevi
     if (block.kind === 'tool-call' && block.name === VISUALIZE_TOOL_NAME) argsRaw = block.argsRaw
   }
   if (argsRaw === undefined) return null
-  return <Preview argsRaw={argsRaw} useLocale={useLocale} />
+  return <Preview argsRaw={argsRaw} />
 }
